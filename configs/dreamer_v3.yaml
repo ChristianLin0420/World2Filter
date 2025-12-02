@@ -1,0 +1,109 @@
+# DreamerV3 Hyperparameters
+# Based on the original DreamerV3 paper: https://arxiv.org/abs/2301.04104
+
+# World Model
+world_model:
+  # RSSM Configuration
+  rssm:
+    deter_size: 4096
+    stoch_size: 32
+    classes: 32
+    hidden_size: 1024
+    gru_layers: 1
+    unimix_ratio: 0.01
+    initial: learned
+    
+  # Encoder Configuration
+  encoder:
+    channels: [96, 192, 384, 768]
+    kernels: [4, 4, 4, 4]
+    strides: [2, 2, 2, 2]
+    norm: layer
+    act: silu
+    
+  # Decoder Configuration
+  decoder:
+    channels: [768, 384, 192, 96]
+    kernels: [4, 4, 4, 4]
+    strides: [2, 2, 2, 2]
+    norm: layer
+    act: silu
+    output_dist: mse  # mse or binary
+    
+  # Reward/Continue Predictors
+  reward_head:
+    layers: 5
+    units: 1024
+    act: silu
+    norm: layer
+    dist: symlog_disc
+    bins: 255
+    
+  continue_head:
+    layers: 5
+    units: 1024
+    act: silu
+    norm: layer
+    
+  # Training
+  optimizer:
+    lr: 1e-4
+    eps: 1e-8
+    clip: 1000.0
+    weight_decay: 0.0
+    warmup_steps: 0
+    
+  # Loss Weights
+  loss:
+    kl_free: 1.0
+    kl_forward: False
+    kl_balance: 0.8
+    kl_weight: 1.0
+    image_weight: 1.0
+    reward_weight: 1.0
+    continue_weight: 1.0
+    
+# Actor-Critic
+actor:
+  layers: 5
+  units: 1024
+  act: silu
+  norm: layer
+  dist: trunc_normal  # trunc_normal for continuous, onehot for discrete
+  min_std: 0.1
+  max_std: 1.0
+  init_std: 0.0
+  entropy_scale: 3e-4
+  unimix_ratio: 0.01
+  optimizer:
+    lr: 3e-5
+    eps: 1e-8
+    clip: 100.0
+    weight_decay: 0.0
+
+critic:
+  layers: 5
+  units: 1024
+  act: silu
+  norm: layer
+  dist: symlog_disc
+  bins: 255
+  slow_target: True
+  slow_target_update: 0.02
+  slow_target_fraction: 0.95
+  optimizer:
+    lr: 3e-5
+    eps: 1e-8
+    clip: 100.0
+    weight_decay: 0.0
+
+# Imagination
+imagination:
+  horizon: 15
+  discount: 0.997
+  lambda_: 0.95
+  return_normalization: True
+  return_ema_decay: 0.99
+  return_scale_lo: 1.0
+  return_scale_hi: 1.0
+

@@ -1,0 +1,54 @@
+# Distracting Control Suite Configuration
+
+environment:
+  # Base environment settings
+  suite: distracting_control
+  domain: walker
+  task: walk
+  
+  # Distraction settings
+  distractions:
+    background: True
+    camera: False
+    color: False
+    background_dataset_path: null  # Path to DAVIS dataset if using video backgrounds
+    background_dataset_videos: null
+    background_dynamic: True
+    
+  # Observation settings
+  obs:
+    image_size: 64
+    channels: 3
+    frame_stack: 1
+    action_repeat: 2
+    
+  # Episode settings
+  time_limit: 1000
+  
+  # Available tasks for benchmarking
+  benchmark_tasks:
+    - domain: walker
+      task: walk
+    - domain: walker
+      task: run
+    - domain: cheetah
+      task: run
+    - domain: cartpole
+      task: swingup
+    - domain: finger
+      task: spin
+    - domain: reacher
+      task: easy
+    - domain: ball_in_cup
+      task: catch
+      
+# SAM3 Segmentation Settings (for World2Filter)
+segmentation:
+  enabled: False  # Enable for World2Filter training
+  model: sam3
+  prompt: "robot"  # Text prompt for SAM3
+  cache_masks: True
+  cache_dir: ./mask_cache
+  device: cuda
+  batch_size: 32
+

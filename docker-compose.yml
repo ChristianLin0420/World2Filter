@@ -1,0 +1,38 @@
+# Docker Compose for World2Filter
+#
+# Usage:
+#   docker-compose run --rm world2filter bash           # Interactive shell
+#   docker-compose run --rm world2filter python ...     # Run any command
+#
+# Examples:
+#   docker-compose run --rm world2filter python scripts/train_dreamer.py --config configs/default.yaml
+#   docker-compose run --rm world2filter python scripts/train_dreamer.py --resume
+
+version: '3.8'
+
+services:
+  world2filter:
+    build: .
+    image: world2filter:latest
+    runtime: nvidia
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - MUJOCO_GL=egl
+      - PYOPENGL_PLATFORM=egl
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - PYTHONDONTWRITEBYTECODE=1  # Don't create .pyc files
+      - PYTHONUNBUFFERED=1         # Immediate output (no buffering)
+    volumes:
+      - .:/workspace  # Mount entire project
+    working_dir: /workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: bash
+

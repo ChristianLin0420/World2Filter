@@ -1,0 +1,33 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Configuration Management
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Environment (install dm_control separately if needed)
+# pip install dm_control  # May require mujoco to be installed first
+mujoco>=2.3.0
+
+# Logging and Visualization
+wandb>=0.15.0
+tensorboard>=2.13.0
+matplotlib>=3.7.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+moviepy>=1.0.0  # For WandB video logging
+
+# Utilities
+numpy>=1.24.0
+opencv-python>=4.8.0
+pillow>=10.0.0
+tqdm>=4.65.0
+einops>=0.6.0
+
+# Development
+pytest>=7.0.0
+
+# Optional dependencies (install manually if needed):
+# pip install dm_control  # For DMControl environments
+# pip install git+https://github.com/facebookresearch/sam3.git  # For SAM3 segmentation
