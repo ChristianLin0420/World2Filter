@@ -5,17 +5,20 @@ Implements the full training loop including:
 - World model training from replay buffer
 - Actor-critic training via imagination
 - Environment interaction and data collection
+- Distributed Data Parallel (DDP) training support
 """
 
-import time
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch import Tensor
 from torch.optim import Adam
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from src.models.dreamer_v3.world_model import WorldModel
@@ -26,13 +29,30 @@ from src.training.losses import WorldModelLoss, ActorCriticLoss
 from src.utils.logging import WandbLogger
 
 
-import os
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+def is_main_process() -> bool:
+    """Check if this is the main process (rank 0)."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def get_rank() -> int:
+    """Get the rank of this process."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def get_world_size() -> int:
+    """Get the total number of processes."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
 
 class Trainer:
     """
-    DreamerV3 Trainer.
+    DreamerV3 Trainer with Multi-GPU (DDP) support.
     
     Handles:
     - World model training
@@ -40,6 +60,13 @@ class Trainer:
     - Environment interaction
     - Logging and checkpointing
     - Distributed Data Parallel (DDP) training
+    
+    Design:
+    - Only rank 0 logs to WandB
+    - Only rank 0 saves checkpoints
+    - Each rank has its own environment(s) and replay buffer
+    - Gradients are synchronized across GPUs via DDP
+    - Extensible via hooks (_on_step, _on_episode_end, _compute_wm_loss)
     """
     
     def __init__(
@@ -53,42 +80,52 @@ class Trainer:
     ):
         """
         Args:
-            world_model: World model
-            actor_critic: Actor-critic module
-            env: Training environment
+            world_model: World model (will be wrapped with DDP if distributed)
+            actor_critic: Actor-critic module (will be wrapped with DDP if distributed)
+            env: Training environment (can be single or ParallelEnv)
             config: Training configuration
-            logger: WandB logger
-            device: Device to train on
+            logger: WandB logger (only used on rank 0)
+            device: Device to train on (e.g., "cuda:0")
         """
-        # Check for distributed setup
+        # Distributed setup
         self.is_distributed = dist.is_available() and dist.is_initialized()
-        self.rank = dist.get_rank() if self.is_distributed else 0
-        self.world_size = dist.get_world_size() if self.is_distributed else 1
+        self.rank = get_rank()
+        self.world_size = get_world_size()
+        self.is_main = is_main_process()
         
+        self.device = device
+        self.config = config
+        self.env = env
+        
+        # Only main process logs
+        self.logger = logger if self.is_main else None
+        
+        # Move models to device
         self.world_model = world_model.to(device)
         self.actor_critic = actor_critic.to(device)
         
+        # Store unwrapped references for methods that need direct access
+        self._world_model = world_model
+        self._actor_critic = actor_critic
+        
         # Wrap with DDP if distributed
         if self.is_distributed:
-             # Need to ensure buffers are broadcasted if needed, but usually fine.
-             # find_unused_parameters might be needed if not all parameters are used in every forward pass
-             # (e.g. actor critic might use different parts).
-            self.world_model = DDP(self.world_model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], find_unused_parameters=False)
-            self.actor_critic = DDP(self.actor_critic, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], find_unused_parameters=False)
-            
-        self.env = env
-        self.config = config
-        self.logger = logger if self.rank == 0 else None
-        self.device = device
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.world_model = DDP(
+                self.world_model, 
+                device_ids=[local_rank],
+                find_unused_parameters=False,
+            )
+            self.actor_critic = DDP(
+                self.actor_critic, 
+                device_ids=[local_rank],
+                find_unused_parameters=False,
+            )
         
         # Training config
         train_cfg = config['training']
         self.total_steps = train_cfg['total_steps']
-        # Scale batch size by world size if it's a global batch size (often config is per GPU or global, assuming global here needs care)
-        # Usually config 'batch_size' is per-gpu. If it's global, we divide.
-        # Let's assume config is PER-GPU batch size for simplicity, or GLOBAL?
-        # Standard practice: config is per-GPU batch size.
-        self.batch_size = train_cfg['batch_size'] 
+        self.batch_size = train_cfg['batch_size']
         self.batch_length = train_cfg['batch_length']
         self.prefill_steps = train_cfg['prefill_steps']
         self.train_every = train_cfg['train_every']
@@ -109,7 +146,7 @@ class Trainer:
         self.discount = img_cfg['discount']
         self.lambda_ = img_cfg['lambda_']
         
-        # Initialize replay buffer
+        # Initialize replay buffer (each rank has its own)
         replay_cfg = config['replay']
         self.replay_buffer = ReplayBuffer(
             capacity=replay_cfg['capacity'],
@@ -117,28 +154,25 @@ class Trainer:
             prioritize_ends=replay_cfg['prioritize_ends'],
         )
         
-        # Initialize optimizers
-        # Access underlying module if DDP wrapped
-        wm_params = self.world_model.module.parameters() if self.is_distributed else self.world_model.parameters()
+        # Initialize optimizers (use unwrapped model parameters)
         wm_cfg = config['world_model']['optimizer']
         self.world_model_optimizer = Adam(
-            wm_params,
+            self._world_model.parameters(),
             lr=wm_cfg['lr'],
             eps=wm_cfg['eps'],
             weight_decay=wm_cfg['weight_decay'],
         )
         
-        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
         actor_cfg = config['actor']['optimizer']
         self.actor_optimizer = Adam(
-            ac_module.actor.parameters(),
+            self._actor_critic.actor.parameters(),
             lr=actor_cfg['lr'],
             eps=actor_cfg['eps'],
         )
         
         critic_cfg = config['critic']['optimizer']
         self.critic_optimizer = Adam(
-            ac_module.critic.parameters(),
+            self._actor_critic.critic.parameters(),
             lr=critic_cfg['lr'],
             eps=critic_cfg['eps'],
         )
@@ -177,19 +211,24 @@ class Trainer:
         else:
             self.num_envs = 1
 
+        obs_space = env.observation_space
+        if isinstance(obs_space, dict):
+            obs_shape = obs_space['image']
+        else:
+            obs_shape = obs_space
+            
         self.online_buffers = [
-            OnlineBuffer(
-                obs_shape=env.observation_space['image'] if isinstance(env.observation_space, dict) else env.observation_space,
-                action_dim=env.action_dim,
-            ) for _ in range(self.num_envs)
+            OnlineBuffer(obs_shape=obs_shape, action_dim=env.action_dim)
+            for _ in range(self.num_envs)
         ]
         
         # Current RSSM state for acting
-        self._current_states = [None] * self.num_envs
+        self._current_state = None
         
         # Checkpoint directory
         self.checkpoint_dir = Path(config['checkpoint_dir'])
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     def train(self) -> Dict[str, float]:
         """
@@ -198,22 +237,24 @@ class Trainer:
         Returns:
             Final metrics
         """
-        # Prefill replay buffer if empty (fresh start or resume without buffer)
+        # Prefill replay buffer if empty
         if len(self.replay_buffer) == 0 or self.replay_buffer.num_steps < self.prefill_steps:
-            print(f"Prefilling replay buffer with {self.prefill_steps} steps...")
+            if self.is_main:
+                print(f"Prefilling replay buffer with {self.prefill_steps} steps...")
             self._prefill()
         
-        if self.global_step > 0:
+        if self.global_step > 0 and self.is_main:
             print(f"Resuming training from step {self.global_step}...")
         
         # Main training loop
-        print("Starting training...")
-        pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="Training")
+        if self.is_main:
+            print("Starting training...")
+            pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="Training")
         
         obs, infos = self.env.reset()
         if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
-             obs = np.stack([obs])
-             infos = [infos]
+            obs = np.stack([obs])
+            infos = [infos]
         
         self._current_state = None
         is_first = np.ones(self.num_envs, dtype=bool)
@@ -263,11 +304,10 @@ class Trainer:
                     self.episodes_collected += 1
                     self.online_buffers[i].reset()
                     
-                    # Log episode stats
+                    # Log episode stats (only rank 0)
                     if self.logger:
                         ep_reward = 0
                         ep_len = 0
-                        # Try to find episode stats in info
                         if isinstance(infos[i], dict):
                             if 'episode' in infos[i]:
                                 ep_reward = infos[i]['episode'].get('r', 0)
@@ -279,7 +319,7 @@ class Trainer:
                         self.logger.log_scalar("episode/return", ep_reward, self.global_step)
                         self.logger.log_scalar("episode/length", ep_len, self.global_step)
                     
-                    # Manual reset for single env if needed (ParallelEnv auto-resets)
+                    # Manual reset for single env
                     if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
                         next_obs_i, info_i = self.env.reset()
                         next_obs[i] = next_obs_i
@@ -287,58 +327,58 @@ class Trainer:
             obs = next_obs
             is_first = done
             
-            # Determine if we should train
+            # Update step count
             prev_step = self.global_step
             self.global_step += self.num_envs
             
-            should_train = (self.global_step // self.train_every) > (prev_step // self.train_every)
-            should_log = (self.global_step // self.log_every) > (prev_step // self.log_every)
-            should_eval = (self.global_step // self.eval_every) > (prev_step // self.eval_every)
-            should_ckpt = (self.global_step // self.checkpoint_every) > (prev_step // self.checkpoint_every)
-            
             # Training step
+            should_train = (self.global_step // self.train_every) > (prev_step // self.train_every)
             if should_train:
                 for _ in range(self.train_steps):
                     metrics = self._train_step()
                     self._accumulate_metrics(metrics_accumulator, metrics)
                     self.train_steps_done += 1
             
-            # Logging
-            if should_log and metrics_accumulator:
+            # Logging (only rank 0)
+            should_log = (self.global_step // self.log_every) > (prev_step // self.log_every)
+            if should_log and metrics_accumulator and self.logger:
                 avg_metrics = self._average_metrics(metrics_accumulator)
-                if self.logger:
-                    for key, value in avg_metrics.items():
-                        self.logger.log_scalar(key, value, self.global_step)
+                for key, value in avg_metrics.items():
+                    self.logger.log_scalar(key, value, self.global_step)
                 metrics_accumulator = {}
             
-            # Image logging (reconstructions)
+            # Image logging
             if self.global_step % self.image_log_freq < self.num_envs and self.global_step > 0:
                 self._log_reconstructions()
             
-            # Video logging (dream rollouts)
+            # Video logging
             if self.global_step % self.video_log_freq < self.num_envs and self.global_step > 0:
                 self._log_dream_video()
             
-            # Evaluation
-            if should_eval:
+            # Evaluation (only rank 0)
+            should_eval = (self.global_step // self.eval_every) > (prev_step // self.eval_every)
+            if should_eval and self.is_main:
                 eval_metrics = self._evaluate()
                 if self.logger:
                     for key, value in eval_metrics.items():
                         self.logger.log_scalar(f"eval/{key}", value, self.global_step)
             
-            # Checkpointing
+            # Checkpointing (only rank 0)
+            should_ckpt = (self.global_step // self.checkpoint_every) > (prev_step // self.checkpoint_every)
             if should_ckpt:
                 self._save_checkpoint()
             
-            pbar.update(self.num_envs)
+            if self.is_main:
+                pbar.update(self.num_envs)
         
-        pbar.close()
+        if self.is_main:
+            pbar.close()
         
         # Save final checkpoint
         self._save_checkpoint(is_final=True)
         
         # Final evaluation
-        final_metrics = self._evaluate()
+        final_metrics = self._evaluate() if self.is_main else {}
         
         return final_metrics
     
@@ -346,8 +386,8 @@ class Trainer:
         """Prefill replay buffer with random actions."""
         obs, infos = self.env.reset()
         if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
-             obs = np.stack([obs])
-             infos = [infos]
+            obs = np.stack([obs])
+            infos = [infos]
              
         for buffer in self.online_buffers:
             buffer.reset()
@@ -356,7 +396,7 @@ class Trainer:
         is_first = np.ones(self.num_envs, dtype=bool)
         
         while steps < self.prefill_steps:
-            # Random action (B, action_dim)
+            # Random action
             action = np.random.uniform(-1, 1, (self.num_envs, self.env.action_dim))
             
             next_obs, reward, terminated, truncated, infos = self.env.step(action)
@@ -371,7 +411,6 @@ class Trainer:
             done = terminated | truncated
             
             for i in range(self.num_envs):
-                # Call hook
                 self._on_step(i, obs[i], action[i], reward[i], done[i], infos[i])
                 
                 self.online_buffers[i].add(
@@ -384,10 +423,7 @@ class Trainer:
                 
                 if done[i]:
                     episode = self.online_buffers[i].get_episode()
-                    
-                    # Call hook
                     self._on_episode_end(i, episode, infos[i])
-                    
                     self.replay_buffer.add(episode)
                     self.online_buffers[i].reset()
                     
@@ -405,17 +441,8 @@ class Trainer:
         is_first: np.ndarray,
     ) -> Tuple[np.ndarray, RSSMState]:
         """Get action from policy."""
-        # ... (tensor conversions)
-        obs_tensor = torch.tensor(
-            obs, 
-            dtype=torch.float32,
-            device=self.device
-        )
-        is_first_tensor = torch.tensor(
-            is_first, 
-            dtype=torch.bool,
-            device=self.device
-        )
+        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        is_first_tensor = torch.tensor(is_first, dtype=torch.bool, device=self.device)
         
         batch_size = obs.shape[0]
         action_tensor = torch.zeros(
@@ -424,27 +451,20 @@ class Trainer:
             device=self.device
         )
         
-        # Handle DDP wrapping for method calls
-        wm_module = self.world_model.module if self.is_distributed else self.world_model
-        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
-
-        # Get RSSM state
-        # ... (rest of logic)
-        state, features = wm_module.obs_step(
+        # Use unwrapped model for inference
+        state, features = self._world_model.obs_step(
             obs_tensor,
             action_tensor,
             is_first_tensor,
             self._current_state,
         )
         
-        # Get action from policy
-        action, _ = ac_module.act(features)
+        action, _ = self._actor_critic.act(features)
         
         return action.cpu().numpy(), state
     
     def _train_step(self) -> Dict[str, float]:
         """Single training step."""
-        # Sample from replay buffer
         batch = self.replay_buffer.sample(
             self.batch_size,
             self.batch_length,
@@ -457,8 +477,8 @@ class Trainer:
         # Train actor-critic via imagination
         ac_metrics = self._train_actor_critic(batch)
         
-        # Update slow target
-        self.actor_critic.update_slow_target()
+        # Update slow target (use unwrapped model)
+        self._actor_critic.update_slow_target()
         
         return {**wm_metrics, **ac_metrics}
     
@@ -466,7 +486,7 @@ class Trainer:
         """Train world model on batch."""
         self.world_model_optimizer.zero_grad()
         
-        # Forward pass through world model
+        # Forward pass (DDP handles gradient sync)
         output = self.world_model(
             batch['obs'],
             batch['action'],
@@ -481,7 +501,7 @@ class Trainer:
         
         # Gradient clipping
         grad_norm = nn.utils.clip_grad_norm_(
-            self.world_model.parameters(),
+            self._world_model.parameters(),
             self.wm_clip,
         )
         
@@ -493,10 +513,6 @@ class Trainer:
     
     def _train_actor_critic(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
         """Train actor-critic via imagination."""
-        # Access modules
-        wm_module = self.world_model.module if self.is_distributed else self.world_model
-        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
-        
         # Get initial state for imagination
         with torch.no_grad():
             output = self.world_model(
@@ -504,7 +520,6 @@ class Trainer:
                 batch['action'],
                 batch['is_first'],
             )
-            # Use a random timestep from each sequence as start
             batch_size = batch['obs'].shape[0]
             t_idx = torch.randint(0, batch['obs'].shape[1], (batch_size,))
             
@@ -513,36 +528,32 @@ class Trainer:
                 stoch=output.posterior.stoch[torch.arange(batch_size), t_idx],
                 logits=output.posterior.logits[torch.arange(batch_size), t_idx],
             )
-            start_features = wm_module.rssm.get_features(start_state)
+            start_features = self._world_model.rssm.get_features(start_state)
         
-        # Imagine trajectories
-        features, actions, rewards, continues = wm_module.imagine_with_policy(
+        # Imagine trajectories (use unwrapped for imagination)
+        features, actions, rewards, continues = self._world_model.imagine_with_policy(
             start_features,
             start_state,
-            ac_module.actor,
+            self._actor_critic.actor,
             self.imagination_horizon,
         )
         
         # Compute values
         with torch.no_grad():
-            values = self.actor_critic.value(features)
-            bootstrap = self.actor_critic.target_value(features[:, -1])
+            values = self._actor_critic.value(features)
+            bootstrap = self._actor_critic.target_value(features[:, -1])
         
         # Compute returns
         returns = self.actor_critic_loss.compute_returns(
             rewards, values, continues, bootstrap
         )
-        
-        # Normalize returns
         returns = self.actor_critic_loss.normalize_returns(returns)
-        
-        # Compute advantages
         advantages = returns - values
         
-        # Get log probs and entropy for actor loss
-        _, actor_info = ac_module.actor(features, deterministic=False)
-        log_probs = ac_module.actor.log_prob(features, actions)
-        entropy = ac_module.actor.entropy(features)
+        # Get log probs and entropy
+        _, actor_info = self._actor_critic.actor(features, deterministic=False)
+        log_probs = self._actor_critic.actor.log_prob(features, actions)
+        entropy = self._actor_critic.actor.entropy(features)
         
         # Train actor
         self.actor_optimizer.zero_grad()
@@ -551,14 +562,14 @@ class Trainer:
         )
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(
-            ac_module.actor.parameters(),
+            self._actor_critic.actor.parameters(),
             self.actor_clip,
         )
         self.actor_optimizer.step()
         
-        # Train critic (with fresh forward pass)
+        # Train critic
         features_detached = features.detach()
-        values_pred = self.actor_critic.value(features_detached)
+        values_pred = self._actor_critic.value(features_detached)
         
         self.critic_optimizer.zero_grad()
         critic_loss, critic_metrics = self.actor_critic_loss.critic_loss(
@@ -566,7 +577,7 @@ class Trainer:
         )
         critic_loss.backward()
         critic_grad_norm = nn.utils.clip_grad_norm_(
-            ac_module.critic.parameters(),
+            self._actor_critic.critic.parameters(),
             self.critic_clip,
         )
         self.critic_optimizer.step()
@@ -577,16 +588,18 @@ class Trainer:
         
         return {f"ac/{k}": v.item() if isinstance(v, Tensor) else v for k, v in metrics.items()}
 
+    # ==================== Hooks for extensibility ====================
+    
     def _on_step(self, env_idx: int, obs: np.ndarray, action: np.ndarray, reward: float, done: bool, info: Dict):
-        """Hook for per-step processing."""
+        """Hook for per-step processing. Override in subclasses."""
         pass
 
     def _on_episode_end(self, env_idx: int, episode: Episode, info: Dict):
-        """Hook for episode end."""
+        """Hook for episode end. Override in subclasses."""
         pass
     
     def _compute_wm_loss(self, output, batch) -> Tuple[Tensor, Dict[str, float]]:
-        """Hook to compute world model loss."""
+        """Hook to compute world model loss. Override in subclasses for custom losses."""
         return self.world_model_loss(
             prior=output.prior,
             posterior=output.posterior,
@@ -598,6 +611,8 @@ class Trainer:
             continue_target=batch['cont'],
         )
     
+    # ==================== Evaluation ====================
+    
     def _evaluate(self) -> Dict[str, float]:
         """Evaluate current policy."""
         returns = []
@@ -605,7 +620,7 @@ class Trainer:
         
         obs, infos = self.env.reset()
         if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
-             obs = np.stack([obs])
+            obs = np.stack([obs])
         
         self._current_state = None
         is_first = np.ones(self.num_envs, dtype=bool)
@@ -651,27 +666,31 @@ class Trainer:
             'length_mean': np.mean(lengths),
         }
     
+    # ==================== Checkpointing ====================
+    
     def _save_checkpoint(self, is_final: bool = False):
-        """Save training checkpoint."""
-        # Only save on rank 0
-        if self.rank != 0:
+        """
+        Save training checkpoint with atomic writes and DDP synchronization.
+        
+        Only rank 0 saves, but all ranks wait at a barrier to prevent
+        NCCL timeouts during checkpoint saving.
+        """
+        # Non-main ranks wait at barrier for rank 0 to finish saving
+        if not self.is_main:
+            if self.is_distributed:
+                dist.barrier()
             return
-            
-        # Get WandB run ID if available
+        
         wandb_run_id = None
         if self.logger and hasattr(self.logger, 'run_id'):
             wandb_run_id = self.logger.run_id
-        
-        # Unwrap DDP models for saving
-        wm_state = self.world_model.module.state_dict() if self.is_distributed else self.world_model.state_dict()
-        ac_state = self.actor_critic.module.state_dict() if self.is_distributed else self.actor_critic.state_dict()
         
         checkpoint = {
             'global_step': self.global_step,
             'episodes_collected': self.episodes_collected,
             'train_steps_done': self.train_steps_done,
-            'world_model': wm_state,
-            'actor_critic': ac_state,
+            'world_model': self._world_model.state_dict(),
+            'actor_critic': self._actor_critic.state_dict(),
             'world_model_optimizer': self.world_model_optimizer.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
@@ -680,33 +699,43 @@ class Trainer:
         }
         
         path = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
-        torch.save(checkpoint, path)
-        print(f"Saved checkpoint: {path}", flush=True)
+        temp_path = path.with_suffix('.pt.tmp')
         
-        # Create/update 'latest' symlink for easy resuming
-        latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
-        if latest_path.exists() or latest_path.is_symlink():
-            latest_path.unlink()
-        latest_path.symlink_to(path.name)
+        try:
+            # Atomic write: save to temp file first, then rename
+            torch.save(checkpoint, temp_path)
+            temp_path.rename(path)  # Atomic on POSIX filesystems
+            print(f"Saved checkpoint: {path}", flush=True)
+            
+            # Create/update 'latest' symlink
+            latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
+            if latest_path.exists() or latest_path.is_symlink():
+                latest_path.unlink()
+            latest_path.symlink_to(path.name)
+            
+            # Keep only last 3 checkpoints to save disk space
+            checkpoints = sorted([
+                c for c in self.checkpoint_dir.glob("checkpoint_*.pt") 
+                if not c.is_symlink() and c.name != "checkpoint_latest.pt"
+            ])
+            for ckpt in checkpoints[:-3]:
+                ckpt.unlink()
+                
+        except Exception as e:
+            print(f"Warning: Failed to save checkpoint: {e}", flush=True)
+            # Clean up temp file if it exists
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
         
-        # Keep only last 3 checkpoints (plus latest symlink)
-        checkpoints = sorted([
-            c for c in self.checkpoint_dir.glob("checkpoint_*.pt") 
-            if not c.is_symlink() and c.name != "checkpoint_latest.pt"
-        ])
-        for ckpt in checkpoints[:-3]:
-            ckpt.unlink()
+        # Signal other ranks that save is complete
+        if self.is_distributed:
+            dist.barrier()
     
     def load_checkpoint(self, path: str) -> Optional[str]:
-        """
-        Load training checkpoint.
-        
-        Args:
-            path: Path to checkpoint file
-            
-        Returns:
-            WandB run ID if saved in checkpoint, None otherwise
-        """
+        """Load training checkpoint."""
         print(f"Loading checkpoint from: {path}", flush=True)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
@@ -714,15 +743,8 @@ class Trainer:
         self.episodes_collected = checkpoint['episodes_collected']
         self.train_steps_done = checkpoint['train_steps_done']
         
-        # Unwrap DDP models for loading if needed, or load into wrapped
-        # DDP wrapped models have 'module.' prefix, but we saved unwrapped
-        if self.is_distributed:
-            self.world_model.module.load_state_dict(checkpoint['world_model'])
-            self.actor_critic.module.load_state_dict(checkpoint['actor_critic'])
-        else:
-            self.world_model.load_state_dict(checkpoint['world_model'])
-            self.actor_critic.load_state_dict(checkpoint['actor_critic'])
-            
+        self._world_model.load_state_dict(checkpoint['world_model'])
+        self._actor_critic.load_state_dict(checkpoint['actor_critic'])
         self.world_model_optimizer.load_state_dict(checkpoint['world_model_optimizer'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
@@ -736,15 +758,12 @@ class Trainer:
         """Find the latest checkpoint in a directory."""
         latest = checkpoint_dir / "checkpoint_latest.pt"
         if latest.exists():
-            # Resolve symlink to actual file
             return latest.resolve() if latest.is_symlink() else latest
         
-        # Fallback: find checkpoint with highest step number
         checkpoints = list(checkpoint_dir.glob("checkpoint_*.pt"))
         if not checkpoints:
             return None
         
-        # Extract step numbers and find max
         def get_step(p):
             try:
                 return int(p.stem.split('_')[1])
@@ -753,11 +772,9 @@ class Trainer:
         
         return max(checkpoints, key=get_step)
     
-    def _accumulate_metrics(
-        self,
-        accumulator: Dict[str, list],
-        metrics: Dict[str, float],
-    ):
+    # ==================== Metrics ====================
+    
+    def _accumulate_metrics(self, accumulator: Dict[str, list], metrics: Dict[str, float]):
         """Accumulate metrics for averaging."""
         for key, value in metrics.items():
             if key not in accumulator:
@@ -768,94 +785,57 @@ class Trainer:
         """Average accumulated metrics."""
         return {key: np.mean(values) for key, values in accumulator.items()}
     
+    # ==================== Logging ====================
+    
     def _log_reconstructions(self):
-        """Log image reconstructions to WandB."""
-        # Only log on rank 0
+        """Log image reconstructions to WandB. Only rank 0."""
         if not self.logger:
-             return
+            return
              
-        # Need at least batch_length steps to sample
         min_steps = self.batch_length
         if self.replay_buffer.num_steps < min_steps:
             return
         
         try:
-            # Sample 1 sequence for visualization
             batch = self.replay_buffer.sample(1, self.batch_length)
             
-            # Use base model for inference to avoid DDP overhead/sync issues
-            wm_module = self.world_model.module if self.is_distributed else self.world_model
-            
             with torch.no_grad():
-                # Move to device
                 obs = batch['obs'].to(self.device)
                 action = batch['action'].to(self.device)
                 is_first = batch['is_first'].to(self.device)
                 
-                # Get reconstructions
-                output = wm_module(obs, action, is_first)
-                recon = wm_module.decode(output.features)
+                output = self._world_model(obs, action, is_first)
+                recon = self._world_model.decode(output.features)
                 
-                # Log single pair: original vs reconstructed (C, H, W)
-                original = obs[0, 0]  # First sample, first timestep
+                original = obs[0, 0]
                 reconstructed = recon[0, 0]
                 
-                # Log as two separate images
-                self.logger.log_image(
-                    name="train/original",
-                    image=original,
-                    step=self.global_step,
-                )
-                self.logger.log_image(
-                    name="train/reconstructed", 
-                    image=reconstructed,
-                    step=self.global_step,
-                )
+                self.logger.log_image("train/original", original, self.global_step)
+                self.logger.log_image("train/reconstructed", reconstructed, self.global_step)
         except Exception as e:
             print(f"Warning: Failed to log reconstructions: {e}", flush=True)
     
     def _log_dream_video(self):
-        """Log observation video and reconstructed video to WandB."""
-        # Only log on rank 0
+        """Log observation and reconstructed video to WandB. Only rank 0."""
         if not self.logger:
-             return
+            return
 
-        # Need at least batch_length * num_samples steps to sample
-        min_steps = self.batch_length * 4  # 4 samples for video
+        min_steps = self.batch_length * 4
         if self.replay_buffer.num_steps < min_steps:
             return
         
         try:
-            # Sample a batch
             batch = self.replay_buffer.sample(2, min(32, self.batch_length))
             
-            wm_module = self.world_model.module if self.is_distributed else self.world_model
-            
             with torch.no_grad():
-                # Move to device
                 obs = batch['obs'].to(self.device)
                 action = batch['action'].to(self.device)
                 is_first = batch['is_first'].to(self.device)
                 
-                # Get reconstructions
-                output = wm_module(obs, action, is_first)
-                recon = wm_module.decode(output.features)
+                output = self._world_model(obs, action, is_first)
+                recon = self._world_model.decode(output.features)
                 
-                # Log original observation video (first sample)
-                self.logger.log_video(
-                    name="train/observation_video",
-                    video=obs[:1],  # (1, T, C, H, W)
-                    step=self.global_step,
-                    fps=10,
-                )
-                
-                # Log reconstructed video (first sample)
-                self.logger.log_video(
-                    name="train/reconstruction_video",
-                    video=recon[:1],  # (1, T, C, H, W)
-                    step=self.global_step,
-                    fps=10,
-                )
+                self.logger.log_video("train/observation_video", obs[:1], self.global_step, fps=10)
+                self.logger.log_video("train/reconstruction_video", recon[:1], self.global_step, fps=10)
         except Exception as e:
             print(f"Warning: Failed to log video: {e}", flush=True)
-

@@ -172,8 +172,8 @@ class World2FilterTrainer(Trainer):
     def _on_episode_end(self, env_idx, episode, info):
         """Attach masks to episode."""
         fg_masks, bg_masks = self.online_mask_processors[env_idx].get_episode_masks()
-                episode.fg_mask = fg_masks
-                episode.bg_mask = bg_masks
+        episode.fg_mask = fg_masks
+        episode.bg_mask = bg_masks
         self.online_mask_processors[env_idx].reset()
         
     def _compute_wm_loss(self, output, batch):
@@ -197,8 +197,8 @@ class World2FilterTrainer(Trainer):
             fg_loss = recon_loss
             bg_loss = recon_loss
         
-        # KL loss
-        kl_loss, kl_value = self.world_model.rssm.kl_divergence(
+        # KL loss (use unwrapped model)
+        kl_loss, kl_value = self._world_model.rssm.kl_divergence(
             output.prior, output.posterior,
             free_bits=self.kl_free,
             balance=self.kl_balance,

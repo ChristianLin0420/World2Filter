@@ -16,17 +16,17 @@ checkpoint_dir: ./checkpoints
 
 # Training
 training:
-  total_steps: 1_000_000
-  batch_size: 64              # Batch size for training
+  total_steps: 3_000_000
+  batch_size: 16              # Batch size for training
   batch_length: 64            # Sequence length for BPTT
   prefill_steps: 5000         # Reduced for faster startup
-  train_every: 5              # Train every N env steps
-  train_steps: 2              # Gradient updates per training call (increased for efficiency)
-  eval_every: 1000
+  train_every: 16             # Train every N env steps
+  train_steps: 1              # Gradient updates per training call (increased for efficiency)
+  eval_every: 10000
   eval_episodes: 10
-  checkpoint_every: 1000
+  checkpoint_every: 100000
   log_every: 1000
-  log_video_every: 5000
+  log_video_every: 10000
 
 # Replay Buffer
 replay:
@@ -38,11 +38,11 @@ replay:
 # Logging
 logging:
   use_wandb: True
-  wandb_project: world2filter
+  wandb_project: world2filter_walker_walk
   wandb_entity: null
   log_scalars: True
   log_images: True
   log_videos: True
-  log_histograms: True
-  image_log_freq: 1000
-  video_log_freq: 5000
+  log_histograms: False
+  image_log_freq: 5000
+  video_log_freq: 10000

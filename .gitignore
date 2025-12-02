@@ -214,3 +214,5 @@ checkpoints/
 
 # slurm scripts
 interactive.sh
+sbatch_resume.sh
+slurm-logs/

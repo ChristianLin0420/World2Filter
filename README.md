@@ -161,21 +161,82 @@ python scripts/train_world2filter.py \
 
 ### Parallel Training
 
-You can speed up data collection by running multiple environments in parallel. The implementation is general and works for both DreamerV3 and World2Filter without needing separate trainers.
+The training pipeline supports two types of parallelism that can be combined:
 
-To enable, add `environment.num_envs=N` to your command or config:
+1. **Parallel Environments** - Multiple CPU processes for faster data collection (single GPU)
+2. **Multi-GPU (DDP)** - Distributed training across multiple GPUs
+
+#### Parallel Environments (Single GPU)
+
+Speed up data collection by running multiple environments in parallel on CPU:
 
 ```bash
-# Train with 8 parallel environments
+# Train with 8 parallel environments on 1 GPU
 python scripts/train_dreamer.py \
     --config configs/default.yaml \
     environment.num_envs=8
 
-# Train World2Filter with parallel envs
+# World2Filter with parallel envs
 python scripts/train_world2filter.py \
     --config configs/default.yaml \
     environment.num_envs=8
 ```
+
+#### Multi-GPU Training (DDP)
+
+Use `torchrun` to distribute training across multiple GPUs:
+
+```bash
+# Train on 8 GPUs (each GPU has 1 environment)
+torchrun --nproc_per_node=8 scripts/train_dreamer.py \
+    --config configs/default.yaml
+
+# Train on 4 GPUs with 4 parallel envs per GPU (16 total envs)
+torchrun --nproc_per_node=4 scripts/train_dreamer.py \
+    --config configs/default.yaml \
+    environment.num_envs=4
+
+# World2Filter on multiple GPUs
+torchrun --nproc_per_node=8 scripts/train_world2filter.py \
+    --config configs/default.yaml
+```
+
+#### Multi-Node Training
+
+For training across multiple machines:
+
+```bash
+# On node 0 (master)
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+    --master_addr=<MASTER_IP> --master_port=29500 \
+    scripts/train_dreamer.py --config configs/default.yaml
+
+# On node 1
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
+    --master_addr=<MASTER_IP> --master_port=29500 \
+    scripts/train_dreamer.py --config configs/default.yaml
+```
+
+#### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Single WandB logging** | Only rank 0 logs to WandB (clean dashboard) |
+| **Single checkpoint** | Only rank 0 saves checkpoints |
+| **Independent replay buffers** | Each GPU has its own buffer for sample diversity |
+| **Automatic gradient sync** | DDP handles gradient averaging |
+| **Portable checkpoints** | Saved without DDP wrapper, loadable on any setup |
+| **Flexible design** | Works with any algorithm (DreamerV3, World2Filter, etc.) |
+
+#### Effective Batch Size
+
+With multi-GPU training, the effective batch size scales:
+
+| Config `batch_size` | GPUs | Effective Batch |
+|---------------------|------|-----------------|
+| 64 | 1 | 64 |
+| 64 | 4 | 256 |
+| 64 | 8 | 512 |
 
 ### Resuming Training
 
