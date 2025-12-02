@@ -11,11 +11,12 @@ Usage:
 """
 
 import os
-
 # Set rendering backend for headless servers BEFORE importing dm_control/mujoco
 # Use EGL for NVIDIA GPUs, OSMesa for software rendering
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+import torch.distributed as dist
 
 import argparse
 import sys
@@ -32,6 +33,7 @@ import random
 from src.utils.config import load_config, save_config, print_config
 from src.utils.logging import WandbLogger
 from src.envs.distracting_cs import make_distracting_cs_env
+from src.envs.parallel import ParallelEnv
 from src.models.world2filter.fg_bg_world_model import FGBGWorldModel
 from src.models.dreamer_v3.actor_critic import ActorCritic
 from src.models.segmentation.mask_processor import MaskProcessor, OnlineMaskProcessor
@@ -126,12 +128,14 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-class World2FilterTrainer:
+from src.training.trainer import Trainer
+
+class World2FilterTrainer(Trainer):
     """
     Trainer for World2Filter model.
     
     Extends the base trainer with:
-    - Mask generation during data collection
+    - Mask generation during data collection (via hooks)
     - FG/BG reconstruction loss
     - Segmentation-aware logging
     """
@@ -146,278 +150,34 @@ class World2FilterTrainer:
         logger: WandbLogger = None,
         device: str = "cuda",
     ):
-        self.world_model = world_model.to(device)
-        self.actor_critic = actor_critic.to(device)
+        super().__init__(world_model, actor_critic, env, config, logger, device)
         self.mask_processor = mask_processor
-        self.env = env
-        self.config = config
-        self.logger = logger
-        self.device = device
-        
-        # Training config
-        train_cfg = config['training']
-        self.total_steps = train_cfg['total_steps']
-        self.batch_size = train_cfg['batch_size']
-        self.batch_length = train_cfg['batch_length']
-        self.prefill_steps = train_cfg['prefill_steps']
-        self.train_every = train_cfg['train_every']
-        self.train_steps = train_cfg['train_steps']
-        self.log_every = train_cfg['log_every']
-        self.eval_every = train_cfg['eval_every']
-        self.checkpoint_every = train_cfg['checkpoint_every']
-        
-        # Imagination config
-        img_cfg = config['imagination']
-        self.imagination_horizon = img_cfg['horizon']
-        self.discount = img_cfg['discount']
-        self.lambda_ = img_cfg['lambda_']
-        
-        # Initialize replay buffer
-        replay_cfg = config['replay']
-        self.replay_buffer = ReplayBuffer(
-            capacity=replay_cfg['capacity'],
-            min_length=replay_cfg['min_length'],
-            prioritize_ends=replay_cfg['prioritize_ends'],
-        )
-        
-        # Optimizers
-        wm_cfg = config['world_model']['optimizer']
-        self.world_model_optimizer = torch.optim.Adam(
-            self.world_model.parameters(),
-            lr=wm_cfg['lr'],
-            eps=wm_cfg['eps'],
-        )
-        
-        actor_cfg = config['actor']['optimizer']
-        self.actor_optimizer = torch.optim.Adam(
-            self.actor_critic.actor.parameters(),
-            lr=actor_cfg['lr'],
-        )
-        
-        critic_cfg = config['critic']['optimizer']
-        self.critic_optimizer = torch.optim.Adam(
-            self.actor_critic.critic.parameters(),
-            lr=critic_cfg['lr'],
-        )
         
         # Losses
-        loss_cfg = config['world_model']['loss']
         self.fg_bg_loss = FGBGReconstructionLoss()
+        loss_cfg = config['world_model']['loss']
         self.kl_free = loss_cfg['kl_free']
         self.kl_balance = loss_cfg['kl_balance']
         
-        self.actor_critic_loss = ActorCriticLoss(
-            discount=self.discount,
-            lambda_=self.lambda_,
-            entropy_scale=config['actor']['entropy_scale'],
-        )
-        
-        # Gradient clipping
-        self.wm_clip = wm_cfg['clip']
-        self.actor_clip = actor_cfg['clip']
-        self.critic_clip = critic_cfg['clip']
-        
-        # Tracking
-        self.global_step = 0
-        self.episodes_collected = 0
-        
-        # Online buffer
-        self.online_buffer = OnlineBuffer(
-            obs_shape=env.observation_space['image'],
-            action_dim=env.action_dim,
-        )
-        
-        # Online mask processor
-        self.online_mask_processor = OnlineMaskProcessor(mask_processor)
-        
-        # Agent state
-        self._current_state = None
-        
-        # Checkpoint directory
-        self.checkpoint_dir = Path(config['checkpoint_dir'])
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Online mask processors for each environment
+        self.online_mask_processors = [
+            OnlineMaskProcessor(mask_processor) for _ in range(self.num_envs)
+        ]
     
-    def train(self):
-        """Main training loop."""
-        from tqdm import tqdm
+    def _on_step(self, env_idx, obs, action, reward, done, info):
+        """Update mask processor with new observation."""
+        # obs is (C, H, W)
+        self.online_mask_processors[env_idx].add_observation(obs)
         
-        # Prefill
-        print(f"Prefilling replay buffer with {self.prefill_steps} steps...")
-        self._prefill()
-        
-        # Main loop
-        print("Starting World2Filter training...")
-        pbar = tqdm(total=self.total_steps, desc="Training")
-        
-        obs, info = self.env.reset()
-        self._current_state = None
-        is_first = True
-        self.online_mask_processor.reset()
-        
-        metrics_accumulator = {}
-        
-        while self.global_step < self.total_steps:
-            # Get action
-            with torch.no_grad():
-                action, state = self._get_action(obs, is_first)
-                self._current_state = state
-            
-            # Get mask for current observation
-            fg_mask, bg_mask = self.online_mask_processor.add_observation(obs)
-            
-            # Environment step
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
-            
-            # Store transition with masks
-            self.online_buffer.add(
-                obs=obs,
-                action=action,
-                reward=reward,
-                is_first=is_first,
-                is_terminal=terminated,
-            )
-            
-            obs = next_obs
-            is_first = False
-            self.global_step += 1
-            
-            # Handle episode end
-            if done:
-                episode = self.online_buffer.get_episode()
-                
-                # Add masks to episode
-                fg_masks, bg_masks = self.online_mask_processor.get_episode_masks()
+    def _on_episode_end(self, env_idx, episode, info):
+        """Attach masks to episode."""
+        fg_masks, bg_masks = self.online_mask_processors[env_idx].get_episode_masks()
                 episode.fg_mask = fg_masks
                 episode.bg_mask = bg_masks
-                
-                self.replay_buffer.add(episode)
-                self.episodes_collected += 1
-                self.online_buffer.reset()
-                self.online_mask_processor.reset()
-                
-                # Log
-                if self.logger:
-                    self.logger.log_scalar(
-                        "episode/return",
-                        info.get('episode_reward', 0),
-                        self.global_step
-                    )
-                
-                obs, info = self.env.reset()
-                self._current_state = None
-                is_first = True
-            
-            # Training
-            if self.global_step % self.train_every == 0:
-                for _ in range(self.train_steps):
-                    metrics = self._train_step()
-                    self._accumulate_metrics(metrics_accumulator, metrics)
-            
-            # Logging
-            if self.global_step % self.log_every == 0 and metrics_accumulator:
-                avg_metrics = self._average_metrics(metrics_accumulator)
-                if self.logger:
-                    self.logger.log_scalars(avg_metrics, self.global_step)
-                metrics_accumulator = {}
-            
-            # Checkpoint
-            if self.global_step % self.checkpoint_every == 0:
-                self._save_checkpoint()
-            
-            pbar.update(1)
+        self.online_mask_processors[env_idx].reset()
         
-        pbar.close()
-        return self._evaluate()
-    
-    def _prefill(self):
-        """Prefill replay buffer with random actions."""
-        obs, info = self.env.reset()
-        self.online_buffer.reset()
-        self.online_mask_processor.reset()
-        steps = 0
-        is_first = True
-        
-        while steps < self.prefill_steps:
-            action = np.random.uniform(-1, 1, self.env.action_dim)
-            
-            # Get mask
-            self.online_mask_processor.add_observation(obs)
-            
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
-            
-            self.online_buffer.add(
-                obs=obs,
-                action=action,
-                reward=reward,
-                is_first=is_first,
-                is_terminal=terminated,
-            )
-            
-            obs = next_obs
-            is_first = False
-            steps += 1
-            
-            if done:
-                episode = self.online_buffer.get_episode()
-                fg_masks, bg_masks = self.online_mask_processor.get_episode_masks()
-                episode.fg_mask = fg_masks
-                episode.bg_mask = bg_masks
-                
-                self.replay_buffer.add(episode)
-                self.online_buffer.reset()
-                self.online_mask_processor.reset()
-                
-                obs, info = self.env.reset()
-                is_first = True
-    
-    def _get_action(self, obs: np.ndarray, is_first: bool):
-        """Get action from policy."""
-        obs_tensor = torch.tensor(
-            obs[np.newaxis],
-            dtype=torch.float32,
-            device=self.device
-        )
-        is_first_tensor = torch.tensor([is_first], dtype=torch.bool, device=self.device)
-        action_tensor = torch.zeros(1, self.env.action_dim, device=self.device)
-        
-        state, features = self.world_model.obs_step(
-            obs_tensor, action_tensor, is_first_tensor, self._current_state
-        )
-        
-        action, _ = self.actor_critic.act(features)
-        
-        return action[0].cpu().numpy(), state
-    
-    def _train_step(self):
-        """Single training step."""
-        batch = self.replay_buffer.sample(
-            self.batch_size,
-            self.batch_length,
-            device=self.device,
-        )
-        
-        # Train world model
-        wm_metrics = self._train_world_model(batch)
-        
-        # Train actor-critic
-        ac_metrics = self._train_actor_critic(batch)
-        
-        self.actor_critic.update_slow_target()
-        
-        return {**wm_metrics, **ac_metrics}
-    
-    def _train_world_model(self, batch):
-        """Train world model with FG/BG loss."""
-        self.world_model_optimizer.zero_grad()
-        
-        output = self.world_model(
-            batch['obs'],
-            batch['action'],
-            batch['is_first'],
-        )
-        
+    def _compute_wm_loss(self, output, batch):
+        """Compute World2Filter loss with FG/BG reconstruction."""
         # FG/BG reconstruction loss
         if 'fg_mask' in batch and 'bg_mask' in batch:
             recon_loss, fg_loss, bg_loss, _ = self.fg_bg_loss(
@@ -461,11 +221,7 @@ class World2FilterTrainer:
         # Total loss
         total_loss = recon_loss + kl_loss + reward_loss + continue_loss
         
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.wm_clip)
-        self.world_model_optimizer.step()
-        
-        return {
+        metrics = {
             'wm/total_loss': total_loss.item(),
             'wm/fg_loss': fg_loss.item(),
             'wm/bg_loss': bg_loss.item(),
@@ -475,102 +231,26 @@ class World2FilterTrainer:
             'wm/continue_loss': continue_loss.item(),
         }
     
-    def _train_actor_critic(self, batch):
-        """Train actor-critic via imagination."""
-        with torch.no_grad():
-            output = self.world_model(
-                batch['obs'], batch['action'], batch['is_first']
-            )
-            
-            batch_size = batch['obs'].shape[0]
-            t_idx = torch.randint(0, batch['obs'].shape[1], (batch_size,))
-            
-            from src.models.dreamer_v3.rssm import RSSMState
-            start_state = RSSMState(
-                deter=output.posterior.deter[torch.arange(batch_size), t_idx],
-                stoch=output.posterior.stoch[torch.arange(batch_size), t_idx],
-                logits=output.posterior.logits[torch.arange(batch_size), t_idx],
-            )
-            start_features = self.world_model.rssm.get_features(start_state)
-        
-        features, actions, rewards, continues = self.world_model.imagine_with_policy(
-            start_features, start_state, self.actor_critic.actor, self.imagination_horizon
-        )
-        
-        with torch.no_grad():
-            values = self.actor_critic.value(features)
-            bootstrap = self.actor_critic.target_value(features[:, -1])
-        
-        returns = self.actor_critic_loss.compute_returns(rewards, values, continues, bootstrap)
-        returns = self.actor_critic_loss.normalize_returns(returns)
-        advantages = returns - values
-        
-        log_probs = self.actor_critic.actor.log_prob(features, actions)
-        entropy = self.actor_critic.actor.entropy(features)
-        
-        # Actor
-        self.actor_optimizer.zero_grad()
-        actor_loss, actor_metrics = self.actor_critic_loss.actor_loss(log_probs, entropy, advantages)
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), self.actor_clip)
-        self.actor_optimizer.step()
-        
-        # Critic
-        features_det = features.detach()
-        values_pred = self.actor_critic.value(features_det)
-        
-        self.critic_optimizer.zero_grad()
-        critic_loss, critic_metrics = self.actor_critic_loss.critic_loss(values_pred, returns.detach())
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), self.critic_clip)
-        self.critic_optimizer.step()
-        
-        return {f'ac/{k}': v.item() if hasattr(v, 'item') else v for k, v in {**actor_metrics, **critic_metrics}.items()}
-    
-    def _evaluate(self):
-        """Evaluate current policy."""
-        returns = []
-        for _ in range(10):
-            obs, _ = self.env.reset()
-            state = None
-            is_first = True
-            ep_return = 0
-            
-            while True:
-                with torch.no_grad():
-                    action, state = self._get_action(obs, is_first)
-                obs, reward, term, trunc, _ = self.env.step(action)
-                is_first = False
-                ep_return += reward
-                if term or trunc:
-                    break
-            
-            returns.append(ep_return)
-        
-        return {'return_mean': np.mean(returns), 'return_std': np.std(returns)}
-    
-    def _save_checkpoint(self):
-        """Save checkpoint."""
-        torch.save({
-            'global_step': self.global_step,
-            'world_model': self.world_model.state_dict(),
-            'actor_critic': self.actor_critic.state_dict(),
-        }, self.checkpoint_dir / f'checkpoint_{self.global_step}.pt')
-    
-    def _accumulate_metrics(self, acc, metrics):
-        for k, v in metrics.items():
-            if k not in acc:
-                acc[k] = []
-            acc[k].append(v)
-    
-    def _average_metrics(self, acc):
-        return {k: np.mean(v) for k, v in acc.items()}
+        return total_loss, metrics
 
 
 def main():
     """Main training function."""
     args = parse_args()
     
+    # Initialize distributed training
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+        print(f"Initialized process group: rank {rank}/{world_size}, local_rank {local_rank}")
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        
     # Load configuration
     config_path = project_root / args.config
     config = load_config(config_path, args.overrides)
@@ -590,22 +270,36 @@ def main():
     if args.no_wandb:
         config.logging.use_wandb = False
     
-    device = config.device if torch.cuda.is_available() else "cpu"
-    set_seed(config.seed)
+    if torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    
+    # Set seed
+    set_seed(config.seed + rank)
     
     print("\nConfiguration:")
     print_config(config)
     
     # Create environment
     print("\nCreating environment...")
-    env = make_distracting_cs_env(
-        domain=config.environment.domain,
-        task=config.environment.task,
-        image_size=config.environment.obs.image_size,
-        action_repeat=config.environment.obs.action_repeat,
-        background=config.environment.distractions.background,
-        seed=config.seed,
-    )
+    
+    def make_env():
+        return make_distracting_cs_env(
+            domain=config.environment.domain,
+            task=config.environment.task,
+            image_size=config.environment.obs.image_size,
+            action_repeat=config.environment.obs.action_repeat,
+            background=config.environment.distractions.background,
+            seed=config.seed,
+        )
+        
+    num_envs = config.environment.get('num_envs', 1)
+    if num_envs > 1:
+        print(f"Using {num_envs} parallel environments")
+        env = ParallelEnv([make_env for _ in range(num_envs)])
+    else:
+        env = make_env()
     
     action_dim = env.action_dim
     obs_shape = env.observation_space['image']

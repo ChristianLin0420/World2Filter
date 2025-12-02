@@ -11,11 +11,12 @@ Usage:
 """
 
 import os
-
 # Set rendering backend for headless servers BEFORE importing dm_control/mujoco
 # Use EGL for NVIDIA GPUs, OSMesa for software rendering
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+import torch.distributed as dist
 
 import argparse
 import sys
@@ -32,6 +33,7 @@ import random
 from src.utils.config import load_config, save_config, print_config
 from src.utils.logging import WandbLogger
 from src.envs.distracting_cs import make_distracting_cs_env, get_env_info
+from src.envs.parallel import ParallelEnv
 from src.models.dreamer_v3.world_model import WorldModel
 from src.models.dreamer_v3.actor_critic import ActorCritic
 from src.training.trainer import Trainer
@@ -126,6 +128,19 @@ def main():
     """Main training function."""
     args = parse_args()
     
+    # Initialize distributed training
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+        print(f"Initialized process group: rank {rank}/{world_size}, local_rank {local_rank}")
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        
     # Load configuration
     config_path = project_root / args.config
     config = load_config(config_path, args.overrides)
@@ -141,11 +156,14 @@ def main():
         config.logging.use_wandb = False
     
     # Set device
-    device = config.device if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     print(f"Using device: {device}")
     
-    # Set seed
-    set_seed(config.seed)
+    # Set seed (different for each rank)
+    set_seed(config.seed + rank)
     
     # Print configuration
     print("\nConfiguration:")
@@ -153,18 +171,27 @@ def main():
     
     # Create environment to get info
     print("\nCreating environment...")
-    env = make_distracting_cs_env(
-        domain=config.environment.domain,
-        task=config.environment.task,
-        image_size=config.environment.obs.image_size,
-        action_repeat=config.environment.obs.action_repeat,
-        frame_stack=config.environment.obs.frame_stack,
-        time_limit=config.environment.time_limit,
-        background=config.environment.distractions.background,
-        camera=config.environment.distractions.camera,
-        color=config.environment.distractions.color,
-        seed=config.seed,
-    )
+    
+    def make_env():
+        return make_distracting_cs_env(
+            domain=config.environment.domain,
+            task=config.environment.task,
+            image_size=config.environment.obs.image_size,
+            action_repeat=config.environment.obs.action_repeat,
+            frame_stack=config.environment.obs.frame_stack,
+            time_limit=config.environment.time_limit,
+            background=config.environment.distractions.background,
+            camera=config.environment.distractions.camera,
+            color=config.environment.distractions.color,
+            seed=config.seed,
+        )
+        
+    num_envs = config.environment.get('num_envs', 1)
+    if num_envs > 1:
+        print(f"Using {num_envs} parallel environments")
+        env = ParallelEnv([make_env for _ in range(num_envs)])
+    else:
+        env = make_env()
     
     action_dim = env.action_dim
     obs_shape = env.observation_space['image']
@@ -298,7 +325,8 @@ def main():
         wandb_run_id = trainer.load_checkpoint(str(resume_checkpoint))
     
     # Create WandB logger (after loading checkpoint to get run ID)
-    if config.logging.use_wandb:
+    # Only on rank 0
+    if config.logging.use_wandb and rank == 0:
         print("\nInitializing WandB logger...")
         logger = WandbLogger(
             project=config.logging.wandb_project,
@@ -311,8 +339,9 @@ def main():
         )
         trainer.logger = logger
     
-    # Save configuration
-    save_config(config, log_dir / "config.yaml")
+    # Save configuration (rank 0)
+    if rank == 0:
+        save_config(config, log_dir / "config.yaml")
     
     # Train
     print("\nStarting training...")
@@ -350,6 +379,8 @@ def main():
         env.close()
         if logger:
             logger.finish()
+        if dist.is_initialized():
+            dist.destroy_process_group()
     
     return 0
 

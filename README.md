@@ -159,6 +159,24 @@ python scripts/train_world2filter.py \
     --no-sam3
 ```
 
+### Parallel Training
+
+You can speed up data collection by running multiple environments in parallel. The implementation is general and works for both DreamerV3 and World2Filter without needing separate trainers.
+
+To enable, add `environment.num_envs=N` to your command or config:
+
+```bash
+# Train with 8 parallel environments
+python scripts/train_dreamer.py \
+    --config configs/default.yaml \
+    environment.num_envs=8
+
+# Train World2Filter with parallel envs
+python scripts/train_world2filter.py \
+    --config configs/default.yaml \
+    environment.num_envs=8
+```
+
 ### Resuming Training
 
 Training automatically saves checkpoints. If training is interrupted, you can resume:

@@ -16,17 +16,17 @@ checkpoint_dir: ./checkpoints
 
 # Training
 training:
-  total_steps: 200
+  total_steps: 1_000_000
   batch_size: 64              # Batch size for training
   batch_length: 64            # Sequence length for BPTT
   prefill_steps: 5000         # Reduced for faster startup
   train_every: 5              # Train every N env steps
   train_steps: 2              # Gradient updates per training call (increased for efficiency)
-  eval_every: 50
+  eval_every: 1000
   eval_episodes: 10
-  checkpoint_every: 50
-  log_every: 100
-  log_video_every: 50
+  checkpoint_every: 1000
+  log_every: 1000
+  log_video_every: 5000
 
 # Replay Buffer
 replay:
@@ -44,5 +44,5 @@ logging:
   log_images: True
   log_videos: True
   log_histograms: True
-  image_log_freq: 100
-  video_log_freq: 100
+  image_log_freq: 1000
+  video_log_freq: 5000

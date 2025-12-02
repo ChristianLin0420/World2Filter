@@ -75,15 +75,10 @@ RUN pip install --no-cache-dir moviepy
 
 # Copy source code
 COPY . .
-
-# Install the package in editable mode
 RUN pip install -e .
+RUN pip install gym
 
-# Create directories for logs and checkpoints
-RUN mkdir -p /workspace/logs /workspace/checkpoints /workspace/mask_cache
-
-# Set environment variables for WandB (user should override with their key)
-ENV WANDB_DIR=/workspace/logs
+ENV WANDB_DIR=/workspace/World2Filter/logs
 
 # Default command
 CMD ["/bin/bash"]

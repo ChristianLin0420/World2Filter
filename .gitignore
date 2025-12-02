@@ -211,3 +211,6 @@ logs/
 
 # Checkpoints
 checkpoints/
+
+# slurm scripts
+interactive.sh

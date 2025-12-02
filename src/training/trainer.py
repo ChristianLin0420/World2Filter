@@ -26,6 +26,10 @@ from src.training.losses import WorldModelLoss, ActorCriticLoss
 from src.utils.logging import WandbLogger
 
 
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 class Trainer:
     """
     DreamerV3 Trainer.
@@ -35,6 +39,7 @@ class Trainer:
     - Actor-critic training via imagination
     - Environment interaction
     - Logging and checkpointing
+    - Distributed Data Parallel (DDP) training
     """
     
     def __init__(
@@ -55,17 +60,35 @@ class Trainer:
             logger: WandB logger
             device: Device to train on
         """
+        # Check for distributed setup
+        self.is_distributed = dist.is_available() and dist.is_initialized()
+        self.rank = dist.get_rank() if self.is_distributed else 0
+        self.world_size = dist.get_world_size() if self.is_distributed else 1
+        
         self.world_model = world_model.to(device)
         self.actor_critic = actor_critic.to(device)
+        
+        # Wrap with DDP if distributed
+        if self.is_distributed:
+             # Need to ensure buffers are broadcasted if needed, but usually fine.
+             # find_unused_parameters might be needed if not all parameters are used in every forward pass
+             # (e.g. actor critic might use different parts).
+            self.world_model = DDP(self.world_model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], find_unused_parameters=False)
+            self.actor_critic = DDP(self.actor_critic, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], find_unused_parameters=False)
+            
         self.env = env
         self.config = config
-        self.logger = logger
+        self.logger = logger if self.rank == 0 else None
         self.device = device
         
         # Training config
         train_cfg = config['training']
         self.total_steps = train_cfg['total_steps']
-        self.batch_size = train_cfg['batch_size']
+        # Scale batch size by world size if it's a global batch size (often config is per GPU or global, assuming global here needs care)
+        # Usually config 'batch_size' is per-gpu. If it's global, we divide.
+        # Let's assume config is PER-GPU batch size for simplicity, or GLOBAL?
+        # Standard practice: config is per-GPU batch size.
+        self.batch_size = train_cfg['batch_size'] 
         self.batch_length = train_cfg['batch_length']
         self.prefill_steps = train_cfg['prefill_steps']
         self.train_every = train_cfg['train_every']
@@ -95,24 +118,27 @@ class Trainer:
         )
         
         # Initialize optimizers
+        # Access underlying module if DDP wrapped
+        wm_params = self.world_model.module.parameters() if self.is_distributed else self.world_model.parameters()
         wm_cfg = config['world_model']['optimizer']
         self.world_model_optimizer = Adam(
-            self.world_model.parameters(),
+            wm_params,
             lr=wm_cfg['lr'],
             eps=wm_cfg['eps'],
             weight_decay=wm_cfg['weight_decay'],
         )
         
+        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
         actor_cfg = config['actor']['optimizer']
         self.actor_optimizer = Adam(
-            self.actor_critic.actor.parameters(),
+            ac_module.actor.parameters(),
             lr=actor_cfg['lr'],
             eps=actor_cfg['eps'],
         )
         
         critic_cfg = config['critic']['optimizer']
         self.critic_optimizer = Adam(
-            self.actor_critic.critic.parameters(),
+            ac_module.critic.parameters(),
             lr=critic_cfg['lr'],
             eps=critic_cfg['eps'],
         )
@@ -145,14 +171,21 @@ class Trainer:
         self.episodes_collected = 0
         self.train_steps_done = 0
         
-        # Online buffer for current episode
-        self.online_buffer = OnlineBuffer(
-            obs_shape=env.observation_space['image'],
-            action_dim=env.action_dim,
-        )
+        # Online buffer for current episode(s)
+        if hasattr(env, 'num_envs'):
+            self.num_envs = env.num_envs
+        else:
+            self.num_envs = 1
+
+        self.online_buffers = [
+            OnlineBuffer(
+                obs_shape=env.observation_space['image'] if isinstance(env.observation_space, dict) else env.observation_space,
+                action_dim=env.action_dim,
+            ) for _ in range(self.num_envs)
+        ]
         
         # Current RSSM state for acting
-        self._current_state = None
+        self._current_states = [None] * self.num_envs
         
         # Checkpoint directory
         self.checkpoint_dir = Path(config['checkpoint_dir'])
@@ -177,9 +210,13 @@ class Trainer:
         print("Starting training...")
         pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="Training")
         
-        obs, info = self.env.reset()
+        obs, infos = self.env.reset()
+        if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+             obs = np.stack([obs])
+             infos = [infos]
+        
         self._current_state = None
-        is_first = True
+        is_first = np.ones(self.num_envs, dtype=bool)
         
         metrics_accumulator = {}
         
@@ -190,57 +227,84 @@ class Trainer:
                 self._current_state = state
             
             # Environment step
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
+            next_obs, reward, terminated, truncated, infos = self.env.step(action)
             
-            # Store transition
-            self.online_buffer.add(
-                obs=obs,
-                action=action,
-                reward=reward,
-                is_first=is_first,
-                is_terminal=terminated,
-            )
+            # Normalize for single env
+            if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                next_obs = np.stack([next_obs])
+                reward = np.stack([reward])
+                terminated = np.stack([terminated])
+                truncated = np.stack([truncated])
+                infos = [infos]
+            
+            done = terminated | truncated
+            
+            # Iterate over environments
+            for i in range(self.num_envs):
+                # Call hook
+                self._on_step(i, obs[i], action[i], reward[i], done[i], infos[i])
+                
+                self.online_buffers[i].add(
+                    obs=obs[i],
+                    action=action[i],
+                    reward=reward[i],
+                    is_first=is_first[i],
+                    is_terminal=terminated[i],
+                )
+                
+                if done[i]:
+                    # Add episode to replay buffer
+                    episode = self.online_buffers[i].get_episode()
+                    
+                    # Call hook
+                    self._on_episode_end(i, episode, infos[i])
+                    
+                    self.replay_buffer.add(episode)
+                    self.episodes_collected += 1
+                    self.online_buffers[i].reset()
+                    
+                    # Log episode stats
+                    if self.logger:
+                        ep_reward = 0
+                        ep_len = 0
+                        # Try to find episode stats in info
+                        if isinstance(infos[i], dict):
+                            if 'episode' in infos[i]:
+                                ep_reward = infos[i]['episode'].get('r', 0)
+                                ep_len = infos[i]['episode'].get('l', 0)
+                            elif 'episode_reward' in infos[i]:
+                                ep_reward = infos[i]['episode_reward']
+                                ep_len = infos[i].get('step_count', 0)
+                        
+                        self.logger.log_scalar("episode/return", ep_reward, self.global_step)
+                        self.logger.log_scalar("episode/length", ep_len, self.global_step)
+                    
+                    # Manual reset for single env if needed (ParallelEnv auto-resets)
+                    if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                        next_obs_i, info_i = self.env.reset()
+                        next_obs[i] = next_obs_i
             
             obs = next_obs
-            is_first = False
-            self.global_step += 1
+            is_first = done
             
-            # Handle episode end
-            if done:
-                # Add episode to replay buffer
-                episode = self.online_buffer.get_episode()
-                self.replay_buffer.add(episode)
-                self.episodes_collected += 1
-                self.online_buffer.reset()
-                
-                # Log episode stats
-                if self.logger:
-                    self.logger.log_scalar(
-                        "episode/return", 
-                        info.get('episode_reward', 0),
-                        self.global_step
-                    )
-                    self.logger.log_scalar(
-                        "episode/length",
-                        info.get('step_count', 0),
-                        self.global_step
-                    )
-                
-                # Reset environment
-                obs, info = self.env.reset()
-                self._current_state = None
-                is_first = True
+            # Determine if we should train
+            prev_step = self.global_step
+            self.global_step += self.num_envs
+            
+            should_train = (self.global_step // self.train_every) > (prev_step // self.train_every)
+            should_log = (self.global_step // self.log_every) > (prev_step // self.log_every)
+            should_eval = (self.global_step // self.eval_every) > (prev_step // self.eval_every)
+            should_ckpt = (self.global_step // self.checkpoint_every) > (prev_step // self.checkpoint_every)
             
             # Training step
-            if self.global_step % self.train_every == 0:
+            if should_train:
                 for _ in range(self.train_steps):
                     metrics = self._train_step()
                     self._accumulate_metrics(metrics_accumulator, metrics)
                     self.train_steps_done += 1
             
             # Logging
-            if self.global_step % self.log_every == 0 and metrics_accumulator:
+            if should_log and metrics_accumulator:
                 avg_metrics = self._average_metrics(metrics_accumulator)
                 if self.logger:
                     for key, value in avg_metrics.items():
@@ -248,25 +312,25 @@ class Trainer:
                 metrics_accumulator = {}
             
             # Image logging (reconstructions)
-            if self.global_step % self.image_log_freq == 0 and self.global_step > 0:
+            if self.global_step % self.image_log_freq < self.num_envs and self.global_step > 0:
                 self._log_reconstructions()
             
             # Video logging (dream rollouts)
-            if self.global_step % self.video_log_freq == 0 and self.global_step > 0:
+            if self.global_step % self.video_log_freq < self.num_envs and self.global_step > 0:
                 self._log_dream_video()
             
             # Evaluation
-            if self.global_step % self.eval_every == 0:
+            if should_eval:
                 eval_metrics = self._evaluate()
                 if self.logger:
                     for key, value in eval_metrics.items():
                         self.logger.log_scalar(f"eval/{key}", value, self.global_step)
             
             # Checkpointing
-            if self.global_step % self.checkpoint_every == 0:
+            if should_ckpt:
                 self._save_checkpoint()
             
-            pbar.update(1)
+            pbar.update(self.num_envs)
         
         pbar.close()
         
@@ -280,62 +344,93 @@ class Trainer:
     
     def _prefill(self):
         """Prefill replay buffer with random actions."""
-        obs, info = self.env.reset()
-        self.online_buffer.reset()
+        obs, infos = self.env.reset()
+        if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+             obs = np.stack([obs])
+             infos = [infos]
+             
+        for buffer in self.online_buffers:
+            buffer.reset()
+            
         steps = 0
-        is_first = True
+        is_first = np.ones(self.num_envs, dtype=bool)
         
         while steps < self.prefill_steps:
-            # Random action
-            action = np.random.uniform(-1, 1, self.env.action_dim)
+            # Random action (B, action_dim)
+            action = np.random.uniform(-1, 1, (self.num_envs, self.env.action_dim))
             
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
+            next_obs, reward, terminated, truncated, infos = self.env.step(action)
             
-            self.online_buffer.add(
-                obs=obs,
-                action=action,
-                reward=reward,
-                is_first=is_first,
-                is_terminal=terminated,
-            )
+            if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                next_obs = np.stack([next_obs])
+                reward = np.stack([reward])
+                terminated = np.stack([terminated])
+                truncated = np.stack([truncated])
+                infos = [infos]
+            
+            done = terminated | truncated
+            
+            for i in range(self.num_envs):
+                # Call hook
+                self._on_step(i, obs[i], action[i], reward[i], done[i], infos[i])
+                
+                self.online_buffers[i].add(
+                    obs=obs[i],
+                    action=action[i],
+                    reward=reward[i],
+                    is_first=is_first[i],
+                    is_terminal=terminated[i],
+                )
+                
+                if done[i]:
+                    episode = self.online_buffers[i].get_episode()
+                    
+                    # Call hook
+                    self._on_episode_end(i, episode, infos[i])
+                    
+                    self.replay_buffer.add(episode)
+                    self.online_buffers[i].reset()
+                    
+                    if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                        next_obs_i, info_i = self.env.reset()
+                        next_obs[i] = next_obs_i
             
             obs = next_obs
-            is_first = False
-            steps += 1
-            
-            if done:
-                episode = self.online_buffer.get_episode()
-                self.replay_buffer.add(episode)
-                self.online_buffer.reset()
-                obs, info = self.env.reset()
-                is_first = True
+            is_first = done
+            steps += self.num_envs
     
     def _get_action(
         self,
         obs: np.ndarray,
-        is_first: bool,
+        is_first: np.ndarray,
     ) -> Tuple[np.ndarray, RSSMState]:
         """Get action from policy."""
-        # Convert observation to tensor
+        # ... (tensor conversions)
         obs_tensor = torch.tensor(
-            obs[np.newaxis], 
+            obs, 
             dtype=torch.float32,
             device=self.device
         )
         is_first_tensor = torch.tensor(
-            [is_first], 
+            is_first, 
             dtype=torch.bool,
             device=self.device
         )
+        
+        batch_size = obs.shape[0]
         action_tensor = torch.zeros(
-            1, self.env.action_dim,
+            batch_size, self.env.action_dim,
             dtype=torch.float32,
             device=self.device
         )
         
+        # Handle DDP wrapping for method calls
+        wm_module = self.world_model.module if self.is_distributed else self.world_model
+        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
+
         # Get RSSM state
-        state, features = self.world_model.obs_step(
+        # ... (rest of logic)
+        state, features = wm_module.obs_step(
             obs_tensor,
             action_tensor,
             is_first_tensor,
@@ -343,9 +438,9 @@ class Trainer:
         )
         
         # Get action from policy
-        action, _ = self.actor_critic.act(features)
+        action, _ = ac_module.act(features)
         
-        return action[0].cpu().numpy(), state
+        return action.cpu().numpy(), state
     
     def _train_step(self) -> Dict[str, float]:
         """Single training step."""
@@ -379,16 +474,7 @@ class Trainer:
         )
         
         # Compute loss
-        loss, metrics = self.world_model_loss(
-            prior=output.prior,
-            posterior=output.posterior,
-            image_pred=output.image_pred,
-            image_target=batch['obs'],
-            reward_logits=output.reward_logits,
-            reward_target=batch['reward'],
-            continue_logits=output.continue_logits,
-            continue_target=batch['cont'],
-        )
+        loss, metrics = self._compute_wm_loss(output, batch)
         
         # Backward pass
         loss.backward()
@@ -407,6 +493,10 @@ class Trainer:
     
     def _train_actor_critic(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
         """Train actor-critic via imagination."""
+        # Access modules
+        wm_module = self.world_model.module if self.is_distributed else self.world_model
+        ac_module = self.actor_critic.module if self.is_distributed else self.actor_critic
+        
         # Get initial state for imagination
         with torch.no_grad():
             output = self.world_model(
@@ -423,13 +513,13 @@ class Trainer:
                 stoch=output.posterior.stoch[torch.arange(batch_size), t_idx],
                 logits=output.posterior.logits[torch.arange(batch_size), t_idx],
             )
-            start_features = self.world_model.rssm.get_features(start_state)
+            start_features = wm_module.rssm.get_features(start_state)
         
         # Imagine trajectories
-        features, actions, rewards, continues = self.world_model.imagine_with_policy(
+        features, actions, rewards, continues = wm_module.imagine_with_policy(
             start_features,
             start_state,
-            self.actor_critic.actor,
+            ac_module.actor,
             self.imagination_horizon,
         )
         
@@ -450,9 +540,9 @@ class Trainer:
         advantages = returns - values
         
         # Get log probs and entropy for actor loss
-        _, actor_info = self.actor_critic.actor(features, deterministic=False)
-        log_probs = self.actor_critic.actor.log_prob(features, actions)
-        entropy = self.actor_critic.actor.entropy(features)
+        _, actor_info = ac_module.actor(features, deterministic=False)
+        log_probs = ac_module.actor.log_prob(features, actions)
+        entropy = ac_module.actor.entropy(features)
         
         # Train actor
         self.actor_optimizer.zero_grad()
@@ -461,7 +551,7 @@ class Trainer:
         )
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(
-            self.actor_critic.actor.parameters(),
+            ac_module.actor.parameters(),
             self.actor_clip,
         )
         self.actor_optimizer.step()
@@ -476,7 +566,7 @@ class Trainer:
         )
         critic_loss.backward()
         critic_grad_norm = nn.utils.clip_grad_norm_(
-            self.actor_critic.critic.parameters(),
+            ac_module.critic.parameters(),
             self.critic_clip,
         )
         self.critic_optimizer.step()
@@ -486,36 +576,75 @@ class Trainer:
         metrics['critic_grad_norm'] = critic_grad_norm.item()
         
         return {f"ac/{k}": v.item() if isinstance(v, Tensor) else v for k, v in metrics.items()}
+
+    def _on_step(self, env_idx: int, obs: np.ndarray, action: np.ndarray, reward: float, done: bool, info: Dict):
+        """Hook for per-step processing."""
+        pass
+
+    def _on_episode_end(self, env_idx: int, episode: Episode, info: Dict):
+        """Hook for episode end."""
+        pass
+    
+    def _compute_wm_loss(self, output, batch) -> Tuple[Tensor, Dict[str, float]]:
+        """Hook to compute world model loss."""
+        return self.world_model_loss(
+            prior=output.prior,
+            posterior=output.posterior,
+            image_pred=output.image_pred,
+            image_target=batch['obs'],
+            reward_logits=output.reward_logits,
+            reward_target=batch['reward'],
+            continue_logits=output.continue_logits,
+            continue_target=batch['cont'],
+        )
     
     def _evaluate(self) -> Dict[str, float]:
         """Evaluate current policy."""
         returns = []
         lengths = []
         
-        for _ in range(self.eval_episodes):
-            obs, info = self.env.reset()
-            state = None
-            is_first = True
-            episode_return = 0.0
-            episode_length = 0
-            
-            while True:
-                with torch.no_grad():
-                    action, state = self._get_action(obs, is_first)
-                
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                done = terminated or truncated
-                is_first = False
-                
-                episode_return += reward
-                episode_length += 1
-                
-                if done:
-                    break
-            
-            returns.append(episode_return)
-            lengths.append(episode_length)
+        obs, infos = self.env.reset()
+        if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+             obs = np.stack([obs])
         
+        self._current_state = None
+        is_first = np.ones(self.num_envs, dtype=bool)
+        
+        current_returns = np.zeros(self.num_envs)
+        current_lengths = np.zeros(self.num_envs)
+        
+        while len(returns) < self.eval_episodes:
+            with torch.no_grad():
+                action, state = self._get_action(obs, is_first)
+                self._current_state = state
+            
+            next_obs, reward, terminated, truncated, infos = self.env.step(action)
+            
+            if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                next_obs = np.stack([next_obs])
+                reward = np.stack([reward])
+                terminated = np.stack([terminated])
+                truncated = np.stack([truncated])
+            
+            done = terminated | truncated
+            
+            current_returns += reward
+            current_lengths += 1
+            
+            for i in range(self.num_envs):
+                if done[i]:
+                    returns.append(current_returns[i])
+                    lengths.append(current_lengths[i])
+                    current_returns[i] = 0
+                    current_lengths[i] = 0
+                    
+                    if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
+                        next_obs_i, _ = self.env.reset()
+                        next_obs[i] = next_obs_i
+            
+            obs = next_obs
+            is_first = done
+            
         return {
             'return_mean': np.mean(returns),
             'return_std': np.std(returns),
@@ -524,17 +653,25 @@ class Trainer:
     
     def _save_checkpoint(self, is_final: bool = False):
         """Save training checkpoint."""
+        # Only save on rank 0
+        if self.rank != 0:
+            return
+            
         # Get WandB run ID if available
         wandb_run_id = None
         if self.logger and hasattr(self.logger, 'run_id'):
             wandb_run_id = self.logger.run_id
         
+        # Unwrap DDP models for saving
+        wm_state = self.world_model.module.state_dict() if self.is_distributed else self.world_model.state_dict()
+        ac_state = self.actor_critic.module.state_dict() if self.is_distributed else self.actor_critic.state_dict()
+        
         checkpoint = {
             'global_step': self.global_step,
             'episodes_collected': self.episodes_collected,
             'train_steps_done': self.train_steps_done,
-            'world_model': self.world_model.state_dict(),
-            'actor_critic': self.actor_critic.state_dict(),
+            'world_model': wm_state,
+            'actor_critic': ac_state,
             'world_model_optimizer': self.world_model_optimizer.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
@@ -577,8 +714,15 @@ class Trainer:
         self.episodes_collected = checkpoint['episodes_collected']
         self.train_steps_done = checkpoint['train_steps_done']
         
-        self.world_model.load_state_dict(checkpoint['world_model'])
-        self.actor_critic.load_state_dict(checkpoint['actor_critic'])
+        # Unwrap DDP models for loading if needed, or load into wrapped
+        # DDP wrapped models have 'module.' prefix, but we saved unwrapped
+        if self.is_distributed:
+            self.world_model.module.load_state_dict(checkpoint['world_model'])
+            self.actor_critic.module.load_state_dict(checkpoint['actor_critic'])
+        else:
+            self.world_model.load_state_dict(checkpoint['world_model'])
+            self.actor_critic.load_state_dict(checkpoint['actor_critic'])
+            
         self.world_model_optimizer.load_state_dict(checkpoint['world_model_optimizer'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
@@ -626,14 +770,21 @@ class Trainer:
     
     def _log_reconstructions(self):
         """Log image reconstructions to WandB."""
+        # Only log on rank 0
+        if not self.logger:
+             return
+             
         # Need at least batch_length steps to sample
         min_steps = self.batch_length
-        if not self.logger or self.replay_buffer.num_steps < min_steps:
+        if self.replay_buffer.num_steps < min_steps:
             return
         
         try:
             # Sample 1 sequence for visualization
             batch = self.replay_buffer.sample(1, self.batch_length)
+            
+            # Use base model for inference to avoid DDP overhead/sync issues
+            wm_module = self.world_model.module if self.is_distributed else self.world_model
             
             with torch.no_grad():
                 # Move to device
@@ -642,8 +793,8 @@ class Trainer:
                 is_first = batch['is_first'].to(self.device)
                 
                 # Get reconstructions
-                output = self.world_model(obs, action, is_first)
-                recon = self.world_model.decode(output.features)
+                output = wm_module(obs, action, is_first)
+                recon = wm_module.decode(output.features)
                 
                 # Log single pair: original vs reconstructed (C, H, W)
                 original = obs[0, 0]  # First sample, first timestep
@@ -665,14 +816,20 @@ class Trainer:
     
     def _log_dream_video(self):
         """Log observation video and reconstructed video to WandB."""
+        # Only log on rank 0
+        if not self.logger:
+             return
+
         # Need at least batch_length * num_samples steps to sample
         min_steps = self.batch_length * 4  # 4 samples for video
-        if not self.logger or self.replay_buffer.num_steps < min_steps:
+        if self.replay_buffer.num_steps < min_steps:
             return
         
         try:
             # Sample a batch
             batch = self.replay_buffer.sample(2, min(32, self.batch_length))
+            
+            wm_module = self.world_model.module if self.is_distributed else self.world_model
             
             with torch.no_grad():
                 # Move to device
@@ -681,8 +838,8 @@ class Trainer:
                 is_first = batch['is_first'].to(self.device)
                 
                 # Get reconstructions
-                output = self.world_model(obs, action, is_first)
-                recon = self.world_model.decode(output.features)
+                output = wm_module(obs, action, is_first)
+                recon = wm_module.decode(output.features)
                 
                 # Log original observation video (first sample)
                 self.logger.log_video(

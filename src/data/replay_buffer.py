@@ -200,10 +200,16 @@ class ReplayBuffer:
                 )
         
         sequences = []
+        
+        # For DistributedDataParallel, we want to use a random state that is potentially different across ranks if seeded differently
+        # or identical if we rely on the main random state.
+        # Standard practice is for each rank to sample its own batch.
+        
         for _ in range(batch_size):
             # Sample episode
             if total > 0:
                 # Weighted by available starting positions
+                # Note: random.choices might be slow for very large buffers, but usually fine
                 weights = [
                     max(0, l - sequence_length + 1) 
                     for l in self._episode_lengths

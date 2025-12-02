@@ -5,6 +5,7 @@ environment:
   suite: distracting_control
   domain: walker
   task: walk
+  num_envs: 1 # Number of parallel environments
   
   # Distraction settings
   distractions:
