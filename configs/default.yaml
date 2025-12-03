@@ -1,6 +1,5 @@
 # Default Configuration for World2Filter
 # This file contains base settings inherited by all experiments
-# Optimized for NVIDIA A40 (47GB VRAM)
 
 defaults:
   - _self_
@@ -16,7 +15,7 @@ checkpoint_dir: ./checkpoints
 
 # Training
 training:
-  total_steps: 3_000_000
+  total_steps: 1_000_000
   batch_size: 16              # Batch size for training
   batch_length: 64            # Sequence length for BPTT
   prefill_steps: 5000         # Reduced for faster startup
