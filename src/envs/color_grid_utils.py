@@ -413,9 +413,18 @@ class ColorGridBackground:
                 self._num_cells_per_dim, self._num_cells_per_dim,
                 self._num_colors_per_cell, 3])
         else:
-            # Natural video backgrounds disabled for now
-            # Can be re-enabled if needed
-            raise NotImplementedError("Natural video backgrounds not yet supported in World2Filter")
+            # Natural video backgrounds
+            assert natural_video_dir is not None, \
+                "natural_video_dir must be provided for NATURAL evil level"
+            
+            from src.envs.natural_video_source import load_natural_videos
+            
+            self._natural_video_source = load_natural_videos(
+                shape=(self._height, self._width),
+                video_pattern=natural_video_dir,
+                total_frames=total_natural_frames,
+                grayscale=True,  # Match psp_camera_ready
+            )
 
     def get_background_image(self, t, action, reward) -> np.array:
         """Returns appropriate background image for t, action, reward.
@@ -472,6 +481,9 @@ class ColorGridBackground:
         elif self._evil_level is EvilEnum.MINIMUM_EVIL:
             random_idx = np.random.randint(self._num_colors_per_cell)
             color_grid = self._color_grid[:, :, random_idx, :]
+        elif self._evil_level is EvilEnum.NATURAL:
+            # Return natural video frame directly (no color grid)
+            return self._natural_video_source.get_image()
         elif self._evil_level is EvilEnum.NONE:
             # Return black background when no distraction
             color_grid = np.zeros(

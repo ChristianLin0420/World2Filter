@@ -37,6 +37,9 @@ def make_distracting_cs_env(
     num_colors_per_cell: int = 11664,
     action_dims_to_split: Optional[list] = None,
     action_power: int = 3,
+    # Natural video settings
+    natural_video_dir: Optional[str] = None,
+    total_natural_frames: int = 1000,
     seed: int = 42,
 ) -> DMControlWrapper:
     """
@@ -62,6 +65,8 @@ def make_distracting_cs_env(
         num_colors_per_cell: Total number of color patterns per cell
         action_dims_to_split: Which action dimensions to correlate with background
         action_power: How many discrete bins per action dimension
+        natural_video_dir: Path to natural video files (e.g., Kinetics dataset)
+        total_natural_frames: Number of frames to use from natural videos
         seed: Random seed
     
     Returns:
@@ -93,6 +98,11 @@ def make_distracting_cs_env(
         print(f"  Colors per cell: {num_colors_per_cell}")
         print(f"  Action dims: {action_dims_to_split}, power: {action_power}")
         
+        # Check if natural video mode
+        if evil_enum == EvilEnum.NATURAL and natural_video_dir:
+            print(f"  Using natural videos from: {natural_video_dir}")
+            print(f"  Total frames: {total_natural_frames}")
+        
         color_bg = ColorGridBackground(
             domain_name=domain,
             task_name=task,
@@ -104,6 +114,8 @@ def make_distracting_cs_env(
             height=image_size,
             width=image_size,
             random_seed=seed,
+            natural_video_dir=natural_video_dir,
+            total_natural_frames=total_natural_frames,
         )
     
     # Wrap environment with ColorGrid support

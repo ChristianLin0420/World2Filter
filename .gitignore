@@ -216,3 +216,6 @@ checkpoints/
 interactive.sh
 sbatch_resume.sh
 slurm-logs/
+
+# Debugging
+configs/debug.yaml

@@ -173,51 +173,79 @@ def main():
     # Create environment to get info
     print("\nCreating environment...")
     
-    def make_env():
-        env = make_distracting_cs_env(
-            domain=config.environment.domain,
-            task=config.environment.task,
-            image_size=config.environment.obs.image_size,
-            action_repeat=config.environment.obs.action_repeat,
-            frame_stack=config.environment.obs.frame_stack,
-            time_limit=config.environment.time_limit,
-            # ColorGrid distractions (MDP-correlated)
-            use_color_grid=config.environment.get('use_color_grid', False),
-            evil_level=config.environment.get('evil_level', 'none'),
-            num_cells_per_dim=config.environment.get('num_cells_per_dim', 16),
-            num_colors_per_cell=config.environment.get('num_colors_per_cell', 11664),
-            action_dims_to_split=config.environment.get('action_dims_to_split', None),
-            action_power=config.environment.get('action_power', 3),
-            # Standard distractions (fallback)
-            background=config.environment.distractions.get('background', False),
-            camera=config.environment.distractions.get('camera', False),
-            color=config.environment.distractions.get('color', False),
-            seed=config.seed,
-        )
-        # Wrap with embodied interface
-        env = wrap_embodied(env)
-        return env
+    suite = config['environment']['suite']
+    
+    if suite == 'rlbench':
+        # RLBench environment
+        from src.envs.rlbench_env import make_rlbench_env
         
-    num_envs = config.environment.get('num_envs', 1)
-    if num_envs > 1:
-        print(f"Using {num_envs} parallel environments")
-        env = ParallelEnv([make_env for _ in range(num_envs)])
-    else:
+        task = config['environment']['task']
+        image_size = config['environment']['obs']['image_size']
+        action_repeat = config['environment']['obs']['action_repeat']
+        max_length = config['environment'].get('time_limit', 200)
+        
+        def make_env():
+            return make_rlbench_env(
+                task=task,
+                image_size=image_size,
+                action_repeat=action_repeat,
+                max_length=max_length // action_repeat,
+            )
+        
         env = make_env()
+        
+        # Get observation shape and action dimension from the environment
+        obs_space = env.obs_space if hasattr(env, 'obs_space') else env.observation_space
+        act_space = env.act_space if hasattr(env, 'act_space') else env.action_space
+        
+        obs_shape = obs_space['image'].shape
+        action_dim = act_space['action'].shape[0]
+        
+    elif suite == 'distracting_control':
+        # DMC environment
+        def make_env():
+            env = make_distracting_cs_env(
+                domain=config.environment.domain,
+                task=config.environment.task,
+                image_size=config.environment.obs.image_size,
+                action_repeat=config.environment.obs.action_repeat,
+                frame_stack=config.environment.obs.frame_stack,
+                time_limit=config.environment.time_limit,
+                # ColorGrid distractions (MDP-correlated)
+                use_color_grid=config.environment.get('use_color_grid', False),
+                evil_level=config.environment.get('evil_level', 'none'),
+                num_cells_per_dim=config.environment.get('num_cells_per_dim', 16),
+                num_colors_per_cell=config.environment.get('num_colors_per_cell', 11664),
+                action_dims_to_split=config.environment.get('action_dims_to_split', None),
+                action_power=config.environment.get('action_power', 3),
+                # Standard distractions (fallback)
+                background=config.environment.distractions.get('background', False),
+                camera=config.environment.distractions.get('camera', False),
+                color=config.environment.distractions.get('color', False),
+                seed=config.seed,
+            )
+            # Wrap with embodied interface
+            env = wrap_embodied(env)
+            return env
+        
+        # Create single environment for inspection
+        env = make_env()
+        
+        # Get observation shape and action dimension from the environment
+        obs_space = env.obs_space if hasattr(env, 'obs_space') else env.observation_space
+        act_space = env.act_space if hasattr(env, 'act_space') else env.action_space
+        
+        obs_shape = obs_space['image'].shape
+        action_dim = act_space['action'].shape[0]
     
-    # Get environment specs from wrapped env
-    # For embodied env, we need to extract action dimension from act_space
-    act_space = env.act_space if hasattr(env, 'act_space') else env.envs[0].act_space
-    obs_space = env.obs_space if hasattr(env, 'obs_space') else env.envs[0].obs_space
+    else:
+        raise ValueError(f"Unknown suite: {suite}. Use 'distracting_control' or 'rlbench'")
     
-    action_dim = act_space['action'].shape[0]
-    obs_shape = obs_space['image'].shape
-    
-    print(f"Environment: {config.environment.domain}/{config.environment.task}")
+    print(f"Environment: {config.environment.get('domain', 'rlbench')}/{config.environment.task}")
     print(f"Observation shape: {obs_shape}")
     print(f"Action dimension: {action_dim}")
     
-    # Create world model
+    # Build world model
     print("\nBuilding world model...")
     world_model = WorldModel(
         obs_shape=obs_shape,

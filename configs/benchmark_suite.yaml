@@ -1,0 +1,174 @@
+# Benchmark Suite Configuration
+# This file defines different benchmark types for systematic evaluation
+
+# Benchmark Type 1: Standard DMC (no distractions)
+# Used to establish baseline performance on clean observations
+standard_dmc:
+  use_color_grid: False
+  distractions:
+    background: False
+    camera: False
+    color: False
+  description: "Baseline DMC without any visual distractions"
+
+# Benchmark Type 2: ColorGrid - Maximum Evil (hardest)
+# Background correlates with both action AND reward
+colorgrid_max:
+  use_color_grid: True
+  evil_level: max
+  num_cells_per_dim: 16
+  num_colors_per_cell: 11664
+  action_dims_to_split: null
+  action_power: 3
+  description: "Hardest test - background correlates with action×reward"
+
+# Benchmark Type 3: ColorGrid - Action-Correlated
+# Background correlates with action only
+colorgrid_action:
+  use_color_grid: True
+  evil_level: action
+  num_cells_per_dim: 16
+  num_colors_per_cell: 729  # 3^6 for 6-DOF actions
+  action_dims_to_split: null
+  action_power: 3
+  description: "Tests action invariance - background = f(action)"
+
+# Benchmark Type 4: ColorGrid - Reward-Correlated
+# Background correlates with reward only
+colorgrid_reward:
+  use_color_grid: True
+  evil_level: reward
+  num_cells_per_dim: 16
+  num_colors_per_cell: 256  # Reward discretization bins
+  action_dims_to_split: [0]  # Dummy, not used for reward evil
+  action_power: 1
+  description: "Tests reward invariance - background = f(reward)"
+
+# Benchmark Type 5: ColorGrid - Sequence-Correlated
+# Background correlates with timestep
+colorgrid_sequence:
+  use_color_grid: True
+  evil_level: sequence
+  num_cells_per_dim: 16
+  num_colors_per_cell: 1000
+  action_dims_to_split: null
+  action_power: 3
+  description: "Tests temporal invariance - background = f(timestep)"
+
+# Benchmark Type 6: ColorGrid - Action×Sequence Cross Product
+# Background correlates with action and timestep jointly
+colorgrid_action_sequence:
+  use_color_grid: True
+  evil_level: action_cross_sequence
+  num_cells_per_dim: 16
+  num_colors_per_cell: 2500  # 50^2 or 5^4 depending on action dims
+  action_dims_to_split: [0]  # First action dimension
+  action_power: 4
+  description: "Tests action-temporal correlation - background = f(action, timestep)"
+
+# Benchmark Type 7: ColorGrid - Minimum (random each step)
+# Random background changes each timestep
+colorgrid_minimum:
+  use_color_grid: True
+  evil_level: minimum
+  num_cells_per_dim: 16
+  num_colors_per_cell: 11664
+  action_dims_to_split: null
+  action_power: 3
+  description: "Minimal distraction - random background each step"
+
+# Benchmark Type 8: Distracting Control Suite (Natural Videos)
+# Video backgrounds from Kinetics dataset
+natural_video:
+  use_color_grid: False
+  distractions:
+    background: True
+    camera: False
+    color: False
+    background_dataset_path: null  # Set to Kinetics video path
+    background_dataset_videos: "*.mp4"
+    background_dynamic: True
+  description: "Natural video backgrounds from Kinetics dataset"
+
+# Task groupings for systematic evaluation
+task_groups:
+  # Easy tasks (quick convergence, good for prototyping)
+  easy:
+    - {domain: cartpole, task: swingup}
+    - {domain: reacher, task: easy}
+    - {domain: finger, task: spin}
+  
+  # Medium tasks (standard benchmarks)
+  medium:
+    - {domain: walker, task: walk}
+    - {domain: cheetah, task: run}
+    - {domain: hopper, task: stand}
+  
+  # Hard tasks (challenging, slow convergence)
+  hard:
+    - {domain: walker, task: run}
+    - {domain: humanoid, task: walk}
+    - {domain: quadruped, task: run}
+  
+  # Locomotion suite (all locomotion tasks)
+  locomotion:
+    - {domain: walker, task: walk}
+    - {domain: walker, task: run}
+    - {domain: walker, task: stand}
+    - {domain: cheetah, task: run}
+    - {domain: hopper, task: stand}
+    - {domain: hopper, task: hop}
+    - {domain: humanoid, task: stand}
+    - {domain: humanoid, task: walk}
+    - {domain: humanoid, task: run}
+    - {domain: quadruped, task: walk}
+    - {domain: quadruped, task: run}
+  
+  # Manipulation suite (reaching, grasping, object manipulation)
+  manipulation:
+    - {domain: reacher, task: easy}
+    - {domain: reacher, task: hard}
+    - {domain: finger, task: spin}
+    - {domain: finger, task: turn_easy}
+    - {domain: finger, task: turn_hard}
+    - {domain: ball_in_cup, task: catch}
+  
+  # Control suite (balancing, swingup tasks)
+  control:
+    - {domain: cartpole, task: swingup}
+    - {domain: cartpole, task: swingup_sparse}
+    - {domain: cartpole, task: balance}
+    - {domain: cartpole, task: balance_sparse}
+    - {domain: acrobot, task: swingup}
+    - {domain: pendulum, task: swingup}
+
+# Recommended evaluation protocol
+evaluation_protocol:
+  # Phase 1: Quick validation (easy tasks, no distraction)
+  phase1_validation:
+    benchmark: standard_dmc
+    task_group: easy
+    total_steps: 100_000
+    description: "Verify implementation works on easy tasks"
+  
+  # Phase 2: Standard benchmark (medium tasks, no distraction)
+  phase2_baseline:
+    benchmark: standard_dmc
+    task_group: medium
+    total_steps: 1_000_000
+    description: "Establish baseline performance"
+  
+  # Phase 3: ColorGrid evaluation (medium tasks, all evil levels)
+  phase3_colorgrid:
+    benchmarks: [colorgrid_max, colorgrid_action, colorgrid_reward, colorgrid_sequence]
+    task_group: medium
+    total_steps: 1_000_000
+    description: "Test robustness to MDP-correlated distractions"
+  
+  # Phase 4: Full evaluation (all tasks, hardest distraction)
+  phase4_comprehensive:
+    benchmark: colorgrid_max
+    task_group: locomotion  # or manipulation, or control
+    total_steps: 1_000_000
+    description: "Comprehensive evaluation on full task suite"
+

@@ -1,11 +1,13 @@
-# Distracting Control Suite Configuration
+# Distracting Control Suite and RLBench Configuration
 
 environment:
-  # Base environment settings
+  # Environment type: 'distracting_control' or 'rlbench'
   suite: distracting_control
+  
+  # DMC task settings
   domain: walker
   task: walk
-  num_envs: 8  # 8 parallel environments (1 per GPU for 8-GPU training)
+  num_envs: 1  # 8 parallel environments (1 per GPU for 8-GPU training)
   
   # ColorGrid Distraction settings (MDP-correlated, recommended)
   use_color_grid: True
@@ -34,22 +36,65 @@ environment:
   # Episode settings
   time_limit: 1000
   
-  # Available tasks for benchmarking
+  # Available tasks for benchmarking (comprehensive DMC suite)
   benchmark_tasks:
+    # Locomotion tasks
     - domain: walker
       task: walk
     - domain: walker
       task: run
+    - domain: walker
+      task: stand
     - domain: cheetah
       task: run
-    - domain: cartpole
-      task: swingup
-    - domain: finger
-      task: spin
+    - domain: hopper
+      task: stand
+    - domain: hopper
+      task: hop
+    - domain: humanoid
+      task: stand
+    - domain: humanoid
+      task: walk
+    - domain: humanoid
+      task: run
+    - domain: quadruped
+      task: walk
+    - domain: quadruped
+      task: run
+    # Manipulation tasks
     - domain: reacher
       task: easy
+    - domain: reacher
+      task: hard
+    - domain: finger
+      task: spin
+    - domain: finger
+      task: turn_easy
+    - domain: finger
+      task: turn_hard
     - domain: ball_in_cup
       task: catch
+    # Control tasks
+    - domain: cartpole
+      task: swingup
+    - domain: cartpole
+      task: swingup_sparse
+    - domain: cartpole
+      task: balance
+    - domain: cartpole
+      task: balance_sparse
+    - domain: acrobot
+      task: swingup
+    - domain: pendulum
+      task: swingup
+  
+  # RLBench robotic manipulation tasks
+  rlbench_tasks:
+    - task: reach_target
+      image_size: 64
+      action_repeat: 2
+      shadows: True
+      max_length: 200
       
 # SAM3 Segmentation Settings (for World2Filter)
 segmentation:
