@@ -15,33 +15,32 @@ checkpoint_dir: ./checkpoints
 
 # Training
 training:
-  total_steps: 150
-  batch_size: 16              # Batch size for training
-  batch_length: 64            # Sequence length for BPTT
-  prefill_steps: 5000         # Reduced for faster startup
-  train_every: 16             # Train every N env steps
-  train_steps: 1              # Gradient updates per training call (increased for efficiency)
-  eval_every: 10000
+  total_steps: 1_000_000        # Full production training (1M steps)
+  batch_size: 16                # Batch size per GPU (effective: 16 * num_gpus)
+  batch_length: 64              # Sequence length for BPTT
+  prefill_steps: 5000           # Prefill replay buffer before training
+  train_ratio: 32.0             # Train steps per env step (DreamerV3 default)
+  eval_every: 100_000           # Evaluate every 100k steps
   eval_episodes: 10
-  checkpoint_every: 100000
-  log_every: 50
-  log_video_every: 100
+  checkpoint_every: 50_000      # Save checkpoint every 50k steps
+  log_every: 300                # Log metrics every 300 steps (matches psp_camera_ready)
+  log_video_every: 10_000       # Log videos every 10k steps
 
 # Replay Buffer
 replay:
   capacity: 1_000_000
-  min_length: 1
-  max_length: 0  # 0 means no limit
+  min_length: 1                 # Minimum sequence length
+  max_length: 0                 # 0 means no limit
   prioritize_ends: True
 
 # Logging
 logging:
   use_wandb: True
-  wandb_project: test_world2filter
+  wandb_project: world2filter_walker_walk
   wandb_entity: null
   log_scalars: True
   log_images: True
   log_videos: True
   log_histograms: False
-  image_log_freq: 100
-  video_log_freq: 100
+  image_log_freq: 10_000        # Log images every 10k steps
+  video_log_freq: 10_000        # Log videos every 10k steps

@@ -1,18 +1,23 @@
 # World2Filter
 
-A PyTorch implementation of DreamerV3 world model with SAM3-based foreground/background segmentation for improved visual representation learning.
+A PyTorch implementation of DreamerV3 with MDP-correlated visual distractions (ColorGrid) for robust visual representation learning.
 
 ## Overview
 
-World2Filter extends the DreamerV3 architecture by incorporating Meta's SAM3 (Segment Anything Model 3) to disentangle foreground (agent) and background representations. This enables the world model to learn separate latent representations for the controllable agent and the environment background, improving generalization in visually complex environments.
+World2Filter implements DreamerV3 with advanced visual distraction mechanisms based on psp_camera_ready's proven ColorGrid system. The ColorGrid background correlates with MDP variables (actions, rewards, timesteps), providing a much stronger test of foreground/background separation than standard visual distractions.
 
-## Features
+## Key Features
 
-- **Original DreamerV3**: Full PyTorch implementation of DreamerV3 with discrete latent states
-- **SAM3 Integration**: Preprocessing pipeline using SAM3 for foreground/background segmentation
-- **Dual-Decoder Architecture**: Separate reconstruction heads for foreground and background
-- **DistractingCS Support**: Training on Distracting Control Suite for robust visual learning
-- **WandB Logging**: Comprehensive logging with scalars, images, videos, and histograms
+- **DreamerV3 Implementation**: Full PyTorch implementation with discrete latent states (RSSM)
+- **ColorGrid Distractions**: MDP-correlated background changes that test foreground/background separation
+  - `max`: Background correlates with both action AND reward (hardest)
+  - `action`: Background correlates with action
+  - `reward`: Background correlates with reward
+  - `sequence`: Background correlates with timestep
+  - `minimum`: Random background each step
+- **Multi-GPU Training**: Distributed Data Parallel (DDP) support for 8 GPU training
+- **Embodied Interface**: Compatible with DreamerV3's embodied framework
+- **WandB Logging**: Comprehensive experiment tracking with 20+ metrics
 
 ## Installation
 
@@ -131,25 +136,55 @@ World2Filter/
 
 ## Usage
 
-### Training Original DreamerV3
+### Training DreamerV3
 
 ```bash
-# Basic training (without WandB)
-python scripts/train_dreamer.py \
-    --config configs/default.yaml \
-    --no-wandb
+# Single GPU training (for testing on headless server)
+python scripts/train_dreamer.py --config configs/default.yaml
 
-# Training with specific environment
+# 8 GPU training (production)
+torchrun --nproc_per_node=8 scripts/train_dreamer.py \
+    --config configs/default.yaml
+
+# Train with specific environment
 python scripts/train_dreamer.py \
     --config configs/default.yaml \
     environment.domain=cheetah \
     environment.task=run
+
+# Train with different ColorGrid evil levels
+python scripts/train_dreamer.py \
+    --config configs/default.yaml \
+    environment.evil_level=action  # Options: max, action, reward, sequence, minimum, none
 ```
+
+### ColorGrid Configuration
+
+The ColorGrid system creates MDP-correlated visual distractions:
+
+```yaml
+# configs/distracting_cs.yaml
+environment:
+  use_color_grid: True
+  evil_level: max              # Hardest: correlates with action + reward
+  num_cells_per_dim: 16        # 16×16 grid of color cells
+  num_colors_per_cell: 11664   # Total color patterns (3^6 * reward_bins)
+  action_dims_to_split: null   # null = use all action dimensions
+  action_power: 3              # Discretization per action dim
+```
+
+**Evil Levels**:
+- `max`: Background = f(action, reward) - Hardest test
+- `action`: Background = f(action) - Tests action invariance
+- `reward`: Background = f(reward) - Tests reward invariance
+- `sequence`: Background = f(timestep) - Tests temporal invariance
+- `minimum`: Random background - Minimal distraction
+- `none`: No distraction - Baseline
 
 ### Training World2Filter
 
 ```bash
-# Train World2Filter with SAM3 segmentation
+# Train World2Filter with SAM3 segmentation (future work)
 python scripts/train_world2filter.py \
     --config configs/default.yaml
 
@@ -161,45 +196,46 @@ python scripts/train_world2filter.py \
 
 ### Parallel Training
 
-The training pipeline supports two types of parallelism that can be combined:
+The training pipeline supports multi-GPU distributed training using PyTorch DDP.
 
-1. **Parallel Environments** - Multiple CPU processes for faster data collection (single GPU)
-2. **Multi-GPU (DDP)** - Distributed training across multiple GPUs
+#### Single GPU (Headless Server)
 
-#### Parallel Environments (Single GPU)
-
-Speed up data collection by running multiple environments in parallel on CPU:
+For headless servers with limited EGL contexts (can't run multiple parallel environments):
 
 ```bash
-# Train with 8 parallel environments on 1 GPU
+# Adjusted config for single env
 python scripts/train_dreamer.py \
     --config configs/default.yaml \
-    environment.num_envs=8
-
-# World2Filter with parallel envs
-python scripts/train_world2filter.py \
-    --config configs/default.yaml \
-    environment.num_envs=8
+    environment.num_envs=1 \
+    training.batch_size=2 \
+    training.train_ratio=64.0
 ```
 
-#### Multi-GPU Training (DDP)
+**Note**: Single environment training uses:
+- Smaller `batch_size=2` (faster buffer fill)
+- Higher `train_ratio=64.0` (compensates for slower data collection)
+- Accumulation-based training (waits for enough sequences, not just episodes)
 
-Use `torchrun` to distribute training across multiple GPUs:
+#### 8 GPU Training (Production)
+
+For production training with 8 GPUs:
 
 ```bash
-# Train on 8 GPUs (each GPU has 1 environment)
+# 8 GPUs, 1 environment per GPU (default config)
 torchrun --nproc_per_node=8 scripts/train_dreamer.py \
     --config configs/default.yaml
 
-# Train on 4 GPUs with 4 parallel envs per GPU (16 total envs)
-torchrun --nproc_per_node=4 scripts/train_dreamer.py \
+# 8 GPUs, 2 environments per GPU (16 total)
+torchrun --nproc_per_node=8 scripts/train_dreamer.py \
     --config configs/default.yaml \
-    environment.num_envs=4
-
-# World2Filter on multiple GPUs
-torchrun --nproc_per_node=8 scripts/train_world2filter.py \
-    --config configs/default.yaml
+    environment.num_envs=2
 ```
+
+**Effective Configuration**:
+- `batch_size: 16` per GPU → Effective batch size: **128** (16 × 8)
+- `num_envs: 8` (1 per GPU) → Data collection: **8× faster**
+- `train_ratio: 32.0` → Trains 32× relative to data collection
+- Gradient synchronization: Automatic via DDP
 
 #### Multi-Node Training
 
@@ -221,22 +257,28 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
 
 | Feature | Description |
 |---------|-------------|
+| **ColorGrid Distractions** | MDP-correlated backgrounds for robust testing |
 | **Single WandB logging** | Only rank 0 logs to WandB (clean dashboard) |
 | **Single checkpoint** | Only rank 0 saves checkpoints |
 | **Independent replay buffers** | Each GPU has its own buffer for sample diversity |
 | **Automatic gradient sync** | DDP handles gradient averaging |
+| **Sequence-based sampling** | Can sample multiple sequences from single episode |
 | **Portable checkpoints** | Saved without DDP wrapper, loadable on any setup |
-| **Flexible design** | Works with any algorithm (DreamerV3, World2Filter, etc.) |
 
-#### Effective Batch Size
+#### Effective Batch Size & Training Speed
 
 With multi-GPU training, the effective batch size scales:
 
-| Config `batch_size` | GPUs | Effective Batch |
-|---------------------|------|-----------------|
-| 64 | 1 | 64 |
-| 64 | 4 | 256 |
-| 64 | 8 | 512 |
+| Config `batch_size` | GPUs | Effective Batch | Training Speedup |
+|---------------------|------|-----------------|------------------|
+| 16 | 1 | 16 | 1× |
+| 16 | 4 | 64 | ~3.5× |
+| 16 | 8 | 128 | ~7× |
+
+**Training Speed Formula**:
+- Data collection: `num_gpus × num_envs_per_gpu` environments
+- Gradient steps: `train_ratio × num_envs / batch_length` per env step
+- Example (8 GPUs): 8 envs collect data → 32 gradient steps per env step
 
 ### Resuming Training
 
@@ -318,13 +360,22 @@ Runs are automatically named based on the experiment configuration:
 
 ### Logged Metrics
 
-| Category | Metrics |
-|----------|---------|
-| **World Model** | `wm/total_loss`, `wm/image_loss`, `wm/kl_loss`, `wm/kl_value`, `wm/reward_loss`, `wm/continue_loss`, `wm/grad_norm` |
-| **Actor-Critic** | `ac/actor_loss`, `ac/critic_loss`, `ac/entropy`, `ac/value_mean`, `ac/advantage_mean` |
-| **Episode** | `episode/return`, `episode/length` |
-| **Evaluation** | `eval/return_mean`, `eval/return_std`, `eval/length_mean` |
-| **World2Filter** | `wm/fg_loss`, `wm/bg_loss` (foreground/background reconstruction) |
+All metrics are logged to WandB every 300 steps:
+
+| Category | Metrics | Description |
+|----------|---------|-------------|
+| **World Model** | `wm/total_loss`, `wm/image_loss`, `wm/kl_loss`, `wm/kl_value` | Reconstruction and KL divergence |
+| | `wm/reward_loss`, `wm/continue_loss` | Reward and continuation prediction |
+| | `wm/prior_entropy`, `wm/posterior_entropy` | Latent state entropy |
+| | `wm/wm_grad_norm` | Gradient norm for stability monitoring |
+| **Actor-Critic** | `ac/actor_loss`, `ac/pg_loss` | Policy gradient loss |
+| | `ac/critic_loss` | Value function loss |
+| | `ac/entropy`, `ac/log_prob` | Policy entropy and log probability |
+| | `ac/advantage_mean`, `ac/advantage_std` | Advantage statistics |
+| | `ac/value_mean`, `ac/return_mean` | Value predictions |
+| | `ac/actor_grad_norm`, `ac/critic_grad_norm` | Gradient norms |
+| **Episode** | `episode/return`, `episode/length` | Episode statistics during training |
+| **Evaluation** | `eval/return_mean`, `eval/return_std`, `eval/length_mean` | Evaluation performance (every 100k steps) |
 
 ### Visual Logging
 
@@ -354,38 +405,84 @@ This visualization is crucial for debugging world model quality - a well-trained
 ### DreamerV3 World Model
 
 The world model consists of:
-- **RSSM**: Recurrent State Space Model with 32x32 discrete latent states
-- **Encoder**: CNN-based image encoder
-- **Decoder**: CNN-based image decoder with symlog predictions
-- **Reward/Continue Heads**: MLP predictors for reward and episode continuation
+- **RSSM**: Recurrent State Space Model with 4096-dim deterministic and 32×32 discrete latent states
+- **Encoder**: ResNet-style CNN encoder (96→192→384→768 channels)
+- **Decoder**: ResNet-style CNN decoder (768→384→192→96 channels)
+- **Reward Head**: 5-layer MLP with symlog discrete distribution (255 bins)
+- **Continue Head**: 5-layer MLP for episode continuation prediction
 
-### World2Filter Extension
+### ColorGrid Background System
 
-World2Filter adds:
+From psp_camera_ready's proven implementation:
+- **Grid-based**: 16×16 grid of colored cells
+- **MDP-correlated**: Each cell color is determined by:
+  - `action`: Discretized action dimensions (e.g., 3^6 = 729 combinations)
+  - `reward`: Discretized reward bins
+  - `timestep`: Sequence position
+- **Evil levels**: Different correlation patterns to test different aspects
+
+### Training Paradigm
+
+Following DreamerV3's design:
+- **train_ratio**: 32 gradient updates per environment step
+- **Sequence sampling**: Samples 64-step sequences from episode replay buffer
+- **Can sample from partial episodes**: Uses sequence-based sampling, not episode count
+- **Accumulation**: With single env, accumulates fractional training steps across iterations
+
+### World2Filter Extension (Future Work)
+
+Planned additions:
 - **SAM3 Preprocessing**: Generate foreground/background masks
-- **Dual Decoders**: Separate reconstruction for foreground and background
+- **Dual Decoders**: Separate reconstruction for foreground and background  
 - **Mask-Guided Loss**: Weighted reconstruction loss based on segmentation masks
 
 ## Configuration
 
-Key hyperparameters can be modified in the YAML config files:
+Production configuration for 8 GPU training:
 
 ```yaml
-# configs/dreamer_v3.yaml
+# configs/default.yaml
+training:
+  total_steps: 1_000_000      # 1M steps (standard for DMC)
+  batch_size: 16              # Per GPU (effective: 128 with 8 GPUs)
+  batch_length: 64            # Sequence length for BPTT
+  train_ratio: 32.0           # 32 gradient updates per env step
+  log_every: 300              # Log every 300 steps
+  
+# configs/distracting_cs.yaml
+environment:
+  num_envs: 8                 # 1 environment per GPU
+  use_color_grid: True
+  evil_level: max             # Hardest distraction level
+  
 world_model:
   rssm:
-    deter_size: 4096      # Deterministic state size
-    stoch_size: 32        # Stochastic dimensions
-    classes: 32           # Classes per stochastic dimension
+    deter_size: 4096          # Deterministic state size
+    stoch_size: 32            # Stochastic dimensions
+    classes: 32               # Classes per stochastic dimension
     
 actor:
   layers: 5
   units: 1024
-  entropy_scale: 3e-4     # Entropy bonus for exploration
+  entropy_scale: 3e-4         # Entropy bonus for exploration
 
 imagination:
-  horizon: 15             # Imagination rollout length
-  discount: 0.997         # Discount factor
+  horizon: 15                 # Imagination rollout length
+  discount: 0.997             # Discount factor
+```
+
+### Headless Server Configuration
+
+For single-GPU headless servers with EGL limitations:
+
+```yaml
+# Single environment setup
+environment:
+  num_envs: 1
+  
+training:
+  batch_size: 2               # Reduced for faster buffer fill
+  train_ratio: 64.0           # Compensate for slower data collection
 ```
 
 ## Docker Usage

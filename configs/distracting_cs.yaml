@@ -5,11 +5,19 @@ environment:
   suite: distracting_control
   domain: walker
   task: walk
-  num_envs: 1  # Use 1 for Docker/headless (EGL has limited contexts)
+  num_envs: 8  # 8 parallel environments (1 per GPU for 8-GPU training)
   
-  # Distraction settings
+  # ColorGrid Distraction settings (MDP-correlated, recommended)
+  use_color_grid: True
+  evil_level: max  # Options: max, action, reward, sequence, action_cross_sequence, minimum, random, none
+  num_cells_per_dim: 16  # 16x16 grid of color cells
+  num_colors_per_cell: 11664  # Total number of color patterns (action_power^action_dims * reward_bins)
+  action_dims_to_split: null  # null = use all action dims, or specify list like [0, 1, 2]
+  action_power: 3  # Number of discrete bins per action dimension
+  
+  # Standard Distraction settings (less effective, not recommended)
   distractions:
-    background: True
+    background: False  # Disabled when using ColorGrid
     camera: False
     color: False
     background_dataset_path: null  # Path to DAVIS dataset if using video backgrounds

@@ -33,6 +33,7 @@ import random
 from src.utils.config import load_config, save_config, print_config
 from src.utils.logging import WandbLogger
 from src.envs.distracting_cs import make_distracting_cs_env, get_env_info
+from src.envs.embodied_wrapper import wrap_embodied
 from src.envs.parallel import ParallelEnv
 from src.models.dreamer_v3.world_model import WorldModel
 from src.models.dreamer_v3.actor_critic import ActorCritic
@@ -173,18 +174,29 @@ def main():
     print("\nCreating environment...")
     
     def make_env():
-        return make_distracting_cs_env(
+        env = make_distracting_cs_env(
             domain=config.environment.domain,
             task=config.environment.task,
             image_size=config.environment.obs.image_size,
             action_repeat=config.environment.obs.action_repeat,
             frame_stack=config.environment.obs.frame_stack,
             time_limit=config.environment.time_limit,
-            background=config.environment.distractions.background,
-            camera=config.environment.distractions.camera,
-            color=config.environment.distractions.color,
+            # ColorGrid distractions (MDP-correlated)
+            use_color_grid=config.environment.get('use_color_grid', False),
+            evil_level=config.environment.get('evil_level', 'none'),
+            num_cells_per_dim=config.environment.get('num_cells_per_dim', 16),
+            num_colors_per_cell=config.environment.get('num_colors_per_cell', 11664),
+            action_dims_to_split=config.environment.get('action_dims_to_split', None),
+            action_power=config.environment.get('action_power', 3),
+            # Standard distractions (fallback)
+            background=config.environment.distractions.get('background', False),
+            camera=config.environment.distractions.get('camera', False),
+            color=config.environment.distractions.get('color', False),
             seed=config.seed,
         )
+        # Wrap with embodied interface
+        env = wrap_embodied(env)
+        return env
         
     num_envs = config.environment.get('num_envs', 1)
     if num_envs > 1:
@@ -193,8 +205,13 @@ def main():
     else:
         env = make_env()
     
-    action_dim = env.action_dim
-    obs_shape = env.observation_space['image']
+    # Get environment specs from wrapped env
+    # For embodied env, we need to extract action dimension from act_space
+    act_space = env.act_space if hasattr(env, 'act_space') else env.envs[0].act_space
+    obs_space = env.obs_space if hasattr(env, 'obs_space') else env.envs[0].obs_space
+    
+    action_dim = act_space['action'].shape[0]
+    obs_shape = obs_space['image'].shape
     
     print(f"Environment: {config.environment.domain}/{config.environment.task}")
     print(f"Observation shape: {obs_shape}")

@@ -374,6 +374,26 @@ class ReplayBuffer:
             episode = Episode.from_dict(data)
             self.add(episode)
     
+    def can_sample(self, batch_size: int, sequence_length: int) -> bool:
+        """
+        Check if buffer has enough data to sample batch_size sequences.
+        
+        Args:
+            batch_size: Number of sequences needed
+            sequence_length: Length of each sequence
+            
+        Returns:
+            True if we can sample, False otherwise
+        """
+        if len(self.episodes) == 0:
+            return False
+        
+        # Calculate total possible starting positions
+        total = sum(max(0, l - sequence_length + 1) for l in self._episode_lengths)
+        
+        # Need at least batch_size starting positions
+        return total >= batch_size
+    
     def __len__(self) -> int:
         """Return number of episodes."""
         return len(self.episodes)

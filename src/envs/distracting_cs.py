@@ -3,6 +3,8 @@ Distracting Control Suite Environment Setup.
 
 Provides utilities for creating environments from the Distracting
 Control Suite for robust visual RL training.
+
+Includes ColorGridBackground support for MDP-correlated distractions.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -10,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from src.envs.wrappers import DMControlWrapper, TimeLimit
+from src.envs.color_grid_utils import ColorGridBackground, EvilEnum, EVIL_CHOICE_CONVENIENCE_MAPPING
 
 
 def make_distracting_cs_env(
@@ -27,6 +30,13 @@ def make_distracting_cs_env(
     background_dataset_videos: Optional[str] = None,
     background_dynamic: bool = True,
     difficulty: str = "easy",
+    # ColorGrid distraction settings (MDP-correlated)
+    use_color_grid: bool = False,
+    evil_level: str = "max",
+    num_cells_per_dim: int = 16,
+    num_colors_per_cell: int = 11664,
+    action_dims_to_split: Optional[list] = None,
+    action_power: int = 3,
     seed: int = 42,
 ) -> DMControlWrapper:
     """
@@ -46,63 +56,64 @@ def make_distracting_cs_env(
         background_dataset_videos: Specific videos to use
         background_dynamic: Use dynamic (video) backgrounds
         difficulty: Distraction difficulty ('easy', 'medium', 'hard')
+        use_color_grid: Use ColorGrid MDP-correlated distractions (recommended)
+        evil_level: Type of MDP correlation ('max', 'action', 'reward', 'sequence', 'none')
+        num_cells_per_dim: Number of grid cells per dimension (e.g., 16 for 16x16 grid)
+        num_colors_per_cell: Total number of color patterns per cell
+        action_dims_to_split: Which action dimensions to correlate with background
+        action_power: How many discrete bins per action dimension
         seed: Random seed
     
     Returns:
         Wrapped DMControl environment
     """
-    try:
-        from distracting_control import suite as distracting_suite
-        from dm_control import suite
+    # Load base DMControl environment
+    from dm_control import suite
+    
+    env = suite.load(
+        domain_name=domain,
+        task_name=task,
+        task_kwargs={'random': seed},
+    )
+    
+    # Set up ColorGrid background if requested
+    color_bg = None
+    if use_color_grid:
+        # Get action dimensions if not specified
+        if action_dims_to_split is None:
+            # Use all action dimensions by default
+            action_spec = env.action_spec()
+            action_dims_to_split = list(range(action_spec.shape[0]))
         
-        # Map difficulty to intensity
-        difficulty_map = {
-            'easy': 0.1,
-            'medium': 0.3,
-            'hard': 0.5,
-        }
-        intensity = difficulty_map.get(difficulty, 0.1)
+        # Convert evil level string to enum
+        evil_enum = EVIL_CHOICE_CONVENIENCE_MAPPING.get(evil_level, EvilEnum.MAXIMUM_EVIL)
         
-        # Create base environment
-        if background or camera or color:
-            env = distracting_suite.load(
-                domain_name=domain,
-                task_name=task,
-                difficulty=difficulty,
-                background_dataset_path=background_dataset_path,
-                background_dataset_videos=background_dataset_videos,
-                background_kwargs={'dynamic': background_dynamic} if background else None,
-                camera_kwargs={'scale': intensity} if camera else None,
-                color_kwargs={'scale': intensity} if color else None,
-                pixels_only=True,
-                render_kwargs={'height': image_size, 'width': image_size},
-            )
-        else:
-            # Use standard DMControl without distractions
-            env = suite.load(
-                domain_name=domain,
-                task_name=task,
-                task_kwargs={'random': seed},
-            )
+        print(f"Setting up ColorGrid background: {evil_level} level")
+        print(f"  Grid: {num_cells_per_dim}x{num_cells_per_dim}")
+        print(f"  Colors per cell: {num_colors_per_cell}")
+        print(f"  Action dims: {action_dims_to_split}, power: {action_power}")
         
-    except ImportError:
-        # Fallback to standard DMControl if distracting_control not available
-        print("Warning: distracting_control not found, using standard dm_control")
-        from dm_control import suite
-        
-        env = suite.load(
+        color_bg = ColorGridBackground(
             domain_name=domain,
             task_name=task,
-            task_kwargs={'random': seed},
+            num_cells_per_dim=num_cells_per_dim,
+            num_colors_per_cell=num_colors_per_cell,
+            evil_level=evil_enum,
+            action_dims_to_split=action_dims_to_split,
+            action_power=action_power,
+            height=image_size,
+            width=image_size,
+            random_seed=seed,
         )
     
-    # Wrap environment
+    # Wrap environment with ColorGrid support
     env = DMControlWrapper(
         env,
         image_size=image_size,
         channels=3,
         frame_stack=frame_stack,
         action_repeat=action_repeat,
+        color_bg=color_bg,
     )
     
     # Add time limit

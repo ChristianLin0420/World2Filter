@@ -122,18 +122,20 @@ class Trainer:
                 find_unused_parameters=False,
             )
         
-        # Training config
+        # Training state
         train_cfg = config['training']
         self.total_steps = train_cfg['total_steps']
         self.batch_size = train_cfg['batch_size']
         self.batch_length = train_cfg['batch_length']
         self.prefill_steps = train_cfg['prefill_steps']
-        self.train_every = train_cfg['train_every']
-        self.train_steps = train_cfg['train_steps']
+        self.train_ratio = train_cfg.get('train_ratio', 32.0)  # DreamerV3 trains 32x per env step
         self.eval_every = train_cfg['eval_every']
         self.eval_episodes = train_cfg['eval_episodes']
         self.checkpoint_every = train_cfg['checkpoint_every']
         self.log_every = train_cfg['log_every']
+        
+        # Track fractional training steps for proper train_ratio implementation
+        self._train_steps_accumulated = 0.0
         
         # Logging config
         log_cfg = config.get('logging', {})
@@ -264,11 +266,18 @@ class Trainer:
         while self.global_step < self.total_steps:
             # Get action from policy
             with torch.no_grad():
-                action, state = self._get_action(obs, is_first)
+                action_dict, state = self._get_action(obs, is_first)
                 self._current_state = state
             
-            # Environment step
-            next_obs, reward, terminated, truncated, infos = self.env.step(action)
+            # Environment step (pass embodied format or extract action)
+            if hasattr(self.env, 'act_space') and 'reset' in self.env.act_space:
+                # Embodied interface expects dict
+                next_obs, reward, terminated, truncated, infos = self.env.step(action_dict)
+                action = action_dict['action']  # Extract for buffer storage
+            else:
+                # Regular interface expects array
+                action = action_dict['action'] if isinstance(action_dict, dict) else action_dict
+                next_obs, reward, terminated, truncated, infos = self.env.step(action)
             
             # Normalize for single env
             if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
@@ -282,12 +291,16 @@ class Trainer:
             
             # Iterate over environments
             for i in range(self.num_envs):
+                # Extract image from observation dict
+                obs_img = self._extract_image(obs[i]) if isinstance(obs[i], dict) else obs[i]
+                action_val = action[i] if not isinstance(action, dict) else action['action'][i]
+                
                 # Call hook
-                self._on_step(i, obs[i], action[i], reward[i], done[i], infos[i])
+                self._on_step(i, obs_img, action_val, reward[i], done[i], infos[i])
                 
                 self.online_buffers[i].add(
-                    obs=obs[i],
-                    action=action[i],
+                    obs=obs_img,
+                    action=action_val,
                     reward=reward[i],
                     is_first=is_first[i],
                     is_terminal=terminated[i],
@@ -331,21 +344,31 @@ class Trainer:
             prev_step = self.global_step
             self.global_step += self.num_envs
             
-            # Training step
-            should_train = (self.global_step // self.train_every) > (prev_step // self.train_every)
-            if should_train:
-                for _ in range(self.train_steps):
+            # Training step (train_ratio paradigm with proper accumulation)
+            # train_ratio = number of gradient updates per environment step
+            # Accumulate fractional steps and train when we have >= 1 full step
+            self._train_steps_accumulated += self.train_ratio * self.num_envs / self.batch_length
+            num_train_steps = int(self._train_steps_accumulated)
+            
+            # Check if we can sample enough sequences (not just episode count!)
+            can_train = self.replay_buffer.can_sample(self.batch_size, self.batch_length)
+            
+            if can_train and num_train_steps > 0:
+                for _ in range(num_train_steps):
                     metrics = self._train_step()
                     self._accumulate_metrics(metrics_accumulator, metrics)
                     self.train_steps_done += 1
+                # Subtract the integer part, keep the fraction for next iteration
+                self._train_steps_accumulated -= num_train_steps
             
             # Logging (only rank 0)
             should_log = (self.global_step // self.log_every) > (prev_step // self.log_every)
-            if should_log and metrics_accumulator and self.logger:
-                avg_metrics = self._average_metrics(metrics_accumulator)
-                for key, value in avg_metrics.items():
-                    self.logger.log_scalar(key, value, self.global_step)
-                metrics_accumulator = {}
+            if should_log and self.logger:
+                if metrics_accumulator:
+                    avg_metrics = self._average_metrics(metrics_accumulator)
+                    for key, value in avg_metrics.items():
+                        self.logger.log_scalar(key, value, self.global_step)
+                    metrics_accumulator.clear()
             
             # Image logging
             if self.global_step % self.image_log_freq < self.num_envs and self.global_step > 0:
@@ -397,10 +420,31 @@ class Trainer:
         is_first = np.ones(self.num_envs, dtype=bool)
         
         while steps < self.prefill_steps:
-            # Random action
-            action = np.random.uniform(-1, 1, (self.num_envs, self.env.action_dim))
+            # Random action with embodied format support
+            if hasattr(self.env, 'act_space'):
+                act_space = self.env.act_space
+            elif hasattr(self.env, 'envs'):
+                act_space = self.env.envs[0].act_space
+            else:
+                # Fallback - no embodied format
+                action = np.random.uniform(-1, 1, (self.num_envs, self.env.action_dim))
+                next_obs, reward, terminated, truncated, infos = self.env.step(action)
+                
+            # Generate embodied action if needed
+            if hasattr(self.env, 'act_space') or hasattr(self.env, 'envs'):
+                if 'action' in (act_space if 'action' in act_space else {}):
+                    action_dim = act_space['action'].shape[0]
+                    action_dict = {
+                        'action': np.random.uniform(-1, 1, size=(self.num_envs, action_dim)),
+                        'reset': is_first,
+                    }
+                    next_obs, reward, terminated, truncated, infos = self.env.step(action_dict)
+                    action = action_dict['action']
+                else:
+                    # Fallback
+                    action = np.random.uniform(-1, 1, (self.num_envs, self.env.action_dim))
+                    next_obs, reward, terminated, truncated, infos = self.env.step(action)
             
-            next_obs, reward, terminated, truncated, infos = self.env.step(action)
             
             if self.num_envs == 1 and not hasattr(self.env, 'num_envs'):
                 next_obs = np.stack([next_obs])
@@ -412,11 +456,15 @@ class Trainer:
             done = terminated | truncated
             
             for i in range(self.num_envs):
-                self._on_step(i, obs[i], action[i], reward[i], done[i], infos[i])
+                # Extract image from observation dict
+                obs_img = self._extract_image(obs[i]) if isinstance(obs[i], dict) else obs[i]
+                action_val = action[i] if not isinstance(action, dict) else action['action'][i]
+                
+                self._on_step(i, obs_img, action_val, reward[i], done[i], infos[i])
                 
                 self.online_buffers[i].add(
-                    obs=obs[i],
-                    action=action[i],
+                    obs=obs_img,
+                    action=action_val,
                     reward=reward[i],
                     is_first=is_first[i],
                     is_terminal=terminated[i],
@@ -436,18 +484,47 @@ class Trainer:
             is_first = done
             steps += self.num_envs
     
+    def _extract_image(self, obs):
+        """Extract image from observation (handles both dict and array)."""
+        if isinstance(obs, dict):
+            return obs['image']
+        elif isinstance(obs, np.ndarray) and obs.dtype == np.object_:
+            # Array of dicts
+            return np.stack([o['image'] if isinstance(o, dict) else o for o in obs])
+        else:
+            # Already an image array
+            return obs
+    
     def _get_action(
         self,
         obs: np.ndarray,
         is_first: np.ndarray,
     ) -> Tuple[np.ndarray, RSSMState]:
-        """Get action from policy."""
+        """Get action from policy in embodied format."""
+        # Extract image from embodied observation dict if needed
+        if isinstance(obs, np.ndarray) and obs.dtype == np.object_:
+            # obs is array of dicts - extract images
+            obs = np.stack([o['image'] if isinstance(o, dict) else o for o in obs])
+        elif isinstance(obs, dict):
+            # Single dict observation
+            obs = obs['image']
+        
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
         is_first_tensor = torch.tensor(is_first, dtype=torch.bool, device=self.device)
         
         batch_size = obs.shape[0]
+        
+        # Get action dimension from act_space
+        if hasattr(self.env, 'act_space'):
+            act_space = self.env.act_space
+        elif hasattr(self.env, 'envs'):
+            act_space = self.env.envs[0].act_space
+        else:
+            act_space = {'action': type('obj', (object,), {'shape': (self.env.action_dim,)})}
+        
+        action_dim = act_space['action'].shape[0]
         action_tensor = torch.zeros(
-            batch_size, self.env.action_dim,
+            batch_size, action_dim,
             dtype=torch.float32,
             device=self.device
         )
@@ -462,7 +539,13 @@ class Trainer:
         
         action, _ = self._actor_critic.act(features)
         
-        return action.cpu().numpy(), state
+        # Return action in embodied format (dict with 'action' and 'reset' keys)
+        action_dict = {
+            'action': action.cpu().numpy(),
+            'reset': is_first,
+        }
+        
+        return action_dict, state
     
     def _train_step(self) -> Dict[str, float]:
         """Single training step."""

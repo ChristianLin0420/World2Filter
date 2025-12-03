@@ -18,12 +18,19 @@ class ParallelEnv:
         
         # Create dummy env to get specs
         dummy_env = env_fns[0]()
-        self.observation_space = dummy_env.observation_space
-        self.action_space = dummy_env.action_space
+        
+        # Support both embodied (obs_space/act_space) and gym (observation_space/action_space) naming
+        self.observation_space = getattr(dummy_env, 'observation_space', None) or getattr(dummy_env, 'obs_space', None)
+        self.action_space = getattr(dummy_env, 'action_space', None) or getattr(dummy_env, 'act_space', None)
+        self.obs_space = getattr(dummy_env, 'obs_space', None) or self.observation_space
+        self.act_space = getattr(dummy_env, 'act_space', None) or self.action_space
         
         # Determine action dim
         if hasattr(dummy_env, 'action_dim'):
             self.action_dim = dummy_env.action_dim
+        elif isinstance(self.action_space, dict) and 'action' in self.action_space:
+            # Embodied format
+            self.action_dim = self.action_space['action'].shape[0]
         elif isinstance(self.action_space, dict) and 'shape' in self.action_space:
             self.action_dim = self.action_space['shape'][0]
         elif hasattr(self.action_space, 'shape'):

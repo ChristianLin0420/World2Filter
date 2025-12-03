@@ -28,6 +28,7 @@ class DMControlWrapper:
         frame_stack: int = 1,
         action_repeat: int = 2,
         camera_id: int = 0,
+        color_bg=None,
     ):
         """
         Args:
@@ -37,6 +38,7 @@ class DMControlWrapper:
             frame_stack: Number of frames to stack
             action_repeat: Number of times to repeat each action
             camera_id: Camera ID for rendering
+            color_bg: ColorGridBackground instance for MDP-correlated distractions
         """
         self._env = env
         self.image_size = image_size
@@ -44,6 +46,7 @@ class DMControlWrapper:
         self.frame_stack = frame_stack
         self.action_repeat = action_repeat
         self.camera_id = camera_id
+        self._color_bg = color_bg
         
         # Get action spec
         action_spec = env.action_spec()
@@ -57,6 +60,7 @@ class DMControlWrapper:
         # Episode tracking
         self._step_count = 0
         self._episode_reward = 0.0
+        self._episode_step = 0  # Track steps within episode for ColorGrid
     
     @property
     def observation_space(self) -> Dict[str, Tuple[int, ...]]:
@@ -87,9 +91,10 @@ class DMControlWrapper:
         self._frames = []
         self._step_count = 0
         self._episode_reward = 0.0
+        self._episode_step = 0
         
         # Render and stack initial frames
-        frame = self._render()
+        frame = self._render(action=None, reward=None)
         for _ in range(self.frame_stack):
             self._frames.append(frame)
         
@@ -112,7 +117,10 @@ class DMControlWrapper:
         Returns:
             Tuple of (observation, reward, terminated, truncated, info)
         """
-        # Denormalize action
+        # Store original normalized action for ColorGrid
+        normalized_action = action.copy()
+        
+        # Denormalize action for environment
         action = self._denormalize_action(action)
         
         # Repeat action
@@ -127,11 +135,14 @@ class DMControlWrapper:
         self._step_count += 1
         self._episode_reward += total_reward
         
-        # Update frame stack
-        frame = self._render()
+        # Update frame stack with ColorGrid background
+        frame = self._render(action=normalized_action, reward=total_reward)
         self._frames.append(frame)
         if len(self._frames) > self.frame_stack:
             self._frames.pop(0)
+        
+        # Increment episode step for ColorGrid
+        self._episode_step += 1
         
         obs = self._get_observation()
         
@@ -149,13 +160,30 @@ class DMControlWrapper:
         
         return obs, total_reward, terminated, truncated, info
     
-    def _render(self) -> np.ndarray:
-        """Render observation image."""
+    def _render(self, action=None, reward=None) -> np.ndarray:
+        """Render observation image with optional ColorGrid background."""
         frame = self._env.physics.render(
             height=self.image_size,
             width=self.image_size,
             camera_id=self.camera_id,
         )
+        
+        # Apply ColorGrid background if available
+        if self._color_bg is not None:
+            # Get background based on MDP variables
+            bg_image = self._color_bg.get_background_image(
+                self._episode_step, action, reward
+            )
+            
+            # Create mask (assuming blue background for DMC, adjust if needed)
+            # This is a simple chroma-key approach
+            mask = np.logical_and(
+                (frame[:, :, 2] > frame[:, :, 1]),
+                (frame[:, :, 2] > frame[:, :, 0])
+            )
+            
+            # Replace background
+            frame[mask] = bg_image[mask]
         
         # Convert to channels-first format
         if self.channels == 1:
