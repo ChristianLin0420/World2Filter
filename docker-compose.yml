@@ -25,8 +25,8 @@ services:
       - PYTHONDONTWRITEBYTECODE=1  # Don't create .pyc files
       - PYTHONUNBUFFERED=1         # Immediate output (no buffering)
     volumes:
-      - .:/workspace  # Mount entire project
-    working_dir: /workspace
+      - .:/workspace/World2Filter  # Mount project to match SLURM path
+    working_dir: /workspace/World2Filter
     deploy:
       resources:
         reservations:

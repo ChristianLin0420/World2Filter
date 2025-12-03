@@ -328,10 +328,26 @@ Runs are automatically named based on the experiment configuration:
 
 ### Visual Logging
 
-- **Reconstructions**: Side-by-side original vs reconstructed images
-- **Latent Distributions**: Heatmaps of posterior/prior distributions
-- **Dream Rollouts**: Imagined future trajectories
-- **Segmentation Masks**: FG/BG mask overlays (World2Filter only)
+| Media Type | WandB Keys | Description |
+|------------|-----------|-------------|
+| **Original Image** | `train/original` | Ground truth observation from replay buffer |
+| **Reconstructed Image** | `train/reconstructed` | World model reconstruction from posterior |
+| **Observation Video** | `train/observation_video` | Actual environment frames |
+| **Reconstruction Video** | `train/reconstruction_video` | Decoded frames from posterior states |
+| **Imagined Video** | `train/imagination/imagined` | Future frames predicted by world model + policy |
+| **Imagination Comparison** | `train/imagination/comparison` | Side-by-side: ground truth (left) vs imagined (right) |
+| **Segmentation Masks** | `segmentation/*` | FG/BG mask overlays (World2Filter only) |
+
+#### Imagination Video (Key DreamerV3 Feature)
+
+The imagination video shows the model's ability to predict future frames:
+1. **Context**: First 5 frames are used to establish the world model's internal state
+2. **Imagination**: The model then imagines the next 15 frames using:
+   - The learned world model dynamics (RSSM)
+   - The current policy to select actions
+3. **Comparison**: Imagined frames are compared with actual ground truth futures
+
+This visualization is crucial for debugging world model quality - a well-trained model should produce plausible future predictions that match the ground truth structure.
 
 ## Architecture
 

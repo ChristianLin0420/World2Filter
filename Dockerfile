@@ -57,8 +57,8 @@ RUN python -m pip install --upgrade pip setuptools wheel
 ENV MUJOCO_GL=egl
 ENV PYOPENGL_PLATFORM=egl
 
-# Create working directory
-WORKDIR /workspace
+# Create working directory matching SLURM mount path
+WORKDIR /workspace/World2Filter
 
 # Copy requirements first for better caching
 COPY requirements.txt .
@@ -73,8 +73,11 @@ RUN pip install --no-cache-dir dm_control --no-deps && \
 # Install moviepy for video logging
 RUN pip install --no-cache-dir moviepy
 
-# Copy source code
+# Copy source code (will be overwritten by mount at runtime)
 COPY . .
+
+# Install package in editable mode - this creates a .egg-link pointing to /workspace/World2Filter
+# When you mount your code here, it will use the mounted (live) code
 RUN pip install -e .
 RUN pip install gym
 

@@ -354,6 +354,7 @@ class Trainer:
             # Video logging
             if self.global_step % self.video_log_freq < self.num_envs and self.global_step > 0:
                 self._log_dream_video()
+                self._log_imagination_video()  # Log imagined future rollouts
             
             # Evaluation (only rank 0)
             should_eval = (self.global_step // self.eval_every) > (prev_step // self.eval_every)
@@ -839,3 +840,104 @@ class Trainer:
                 self.logger.log_video("train/reconstruction_video", recon[:1], self.global_step, fps=10)
         except Exception as e:
             print(f"Warning: Failed to log video: {e}", flush=True)
+    
+    def _log_imagination_video(self):
+        """
+        Log imagined future video rollout to WandB. Only rank 0.
+        
+        This is the key DreamerV3 visualization: starting from a real observation,
+        the model imagines future frames using the learned world model and policy.
+        The imagined frames are compared with the actual ground truth futures.
+        
+        Logs:
+        - train/imagination_ground_truth: Actual future frames from environment
+        - train/imagination_predicted: Imagined future frames from world model
+        """
+        if not self.logger:
+            return
+        
+        # Need enough data for context + imagination horizon
+        imagination_horizon = getattr(self, 'imagination_horizon', 15)
+        context_frames = 5  # Use first few frames to establish state
+        total_needed = context_frames + imagination_horizon
+        
+        min_steps = self.batch_length * 4
+        if self.replay_buffer.num_steps < min_steps:
+            return
+        
+        try:
+            # Sample a sequence long enough for context + future ground truth
+            seq_length = min(total_needed + 5, self.batch_length)
+            batch = self.replay_buffer.sample(1, seq_length)
+            
+            with torch.no_grad():
+                obs = batch['obs'].to(self.device)  # (1, T, C, H, W)
+                action = batch['action'].to(self.device)  # (1, T, action_dim)
+                is_first = batch['is_first'].to(self.device)  # (1, T)
+                
+                # Get context frames to establish state
+                context_obs = obs[:, :context_frames]
+                context_action = action[:, :context_frames]
+                context_is_first = is_first[:, :context_frames]
+                
+                # Run world model on context to get posterior state
+                output = self._world_model(context_obs, context_action, context_is_first)
+                
+                # Get the final state from context as starting point for imagination
+                # posterior shape: (batch, time, ...) - we want the last timestep
+                start_state = RSSMState(
+                    deter=output.posterior.deter[:, -1],  # (batch, deter_size)
+                    stoch=output.posterior.stoch[:, -1],  # (batch, stoch_size, classes)
+                    logits=output.posterior.logits[:, -1],  # (batch, stoch_size, classes)
+                )
+                start_features = self._world_model.rssm.get_features(start_state)
+                
+                # Imagine future trajectories using policy
+                imagined_features, imagined_actions, imagined_rewards, imagined_continues = \
+                    self._world_model.imagine_with_policy(
+                        start_features,
+                        start_state,
+                        self._actor_critic.actor,
+                        imagination_horizon,
+                    )
+                
+                # Decode imagined features to images
+                # imagined_features: (batch, horizon, feature_dim)
+                imagined_obs = self._world_model.decode(imagined_features)  # (batch, horizon, C, H, W)
+                
+                # Get ground truth future frames for comparison
+                future_start = context_frames
+                future_end = min(context_frames + imagination_horizon, obs.shape[1])
+                true_future_obs = obs[:, future_start:future_end]  # (1, horizon, C, H, W)
+                
+                # Match lengths (in case ground truth is shorter)
+                actual_horizon = true_future_obs.shape[1]
+                imagined_obs_matched = imagined_obs[:, :actual_horizon]
+                
+                # Log videos using same format as _log_dream_video (keep batch dim, use [:1])
+                # This ensures consistency with observation_video and reconstruction_video
+                self.logger.log_video(
+                    "train/imagination_ground_truth",
+                    true_future_obs[:1],  # (1, T, C, H, W) - keep batch dim like other videos
+                    self.global_step,
+                    fps=10,
+                    caption="Ground Truth Future"
+                )
+                self.logger.log_video(
+                    "train/imagination_predicted",
+                    imagined_obs_matched[:1],  # (1, T, C, H, W) - keep batch dim
+                    self.global_step,
+                    fps=10,
+                    caption="Imagined Future (World Model + Policy)"
+                )
+                
+                # Also log predicted rewards
+                if imagined_rewards is not None:
+                    # Log mean predicted reward over imagination
+                    mean_reward = imagined_rewards.mean().item()
+                    self.logger.log_scalar("train/imagination_mean_reward", mean_reward, self.global_step)
+                    
+        except Exception as e:
+            import traceback
+            print(f"Warning: Failed to log imagination video: {e}", flush=True)
+            traceback.print_exc()

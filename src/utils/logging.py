@@ -209,23 +209,25 @@ class WandbLogger:
         step: int,
         fps: int = 15,
         caption: Optional[str] = None,
+        format: str = "gif",
     ):
         """
         Log a video.
         
         Args:
             name: Video name
-            video: Video array (T, H, W, C) or (T, C, H, W)
+            video: Video array (T, C, H, W) or (B, T, C, H, W)
             step: Training step
             fps: Frames per second
             caption: Optional caption
+            format: Video format ('gif', 'mp4', 'webm')
         """
         if not self.enabled:
             return
         
         video = self._prepare_video(video)
         
-        wandb.log({name: wandb.Video(video, fps=fps, caption=caption)}, step=step)
+        wandb.log({name: wandb.Video(video, fps=fps, format=format, caption=caption)}, step=step)
     
     def log_histogram(
         self,
@@ -378,7 +380,7 @@ class WandbLogger:
         if not self.enabled:
             return
         
-        # Prepare dreamed video
+        # Prepare dreamed video (returns TCHW format)
         dreamed = self._prepare_video(dreamed_obs)
         self.log_video(f"{prefix}/imagined", dreamed, step, caption="Imagined Rollout")
         
@@ -386,8 +388,8 @@ class WandbLogger:
         if true_obs is not None:
             true = self._prepare_video(true_obs)
             
-            # Side by side comparison
-            comparison = np.concatenate([true, dreamed], axis=2)  # Horizontal concat
+            # Side by side comparison (TCHW format: concat along width axis=3)
+            comparison = np.concatenate([true, dreamed], axis=3)  # Horizontal concat
             self.log_video(
                 f"{prefix}/comparison", 
                 comparison, 
@@ -492,13 +494,26 @@ class WandbLogger:
         return images
     
     def _prepare_video(self, video: Union[np.ndarray, Tensor]) -> np.ndarray:
-        """Prepare video for logging."""
+        """Prepare video for logging to wandb.Video.
+        
+        Args:
+            video: Video array with shape (T, C, H, W), (T, H, W, C), 
+                   (B, T, C, H, W) or (B, T, H, W, C). Batch dim is squeezed.
+        
+        Returns:
+            Video array with shape (T, C, H, W) in uint8 format for wandb.Video.
+        """
         if isinstance(video, Tensor):
             video = video.detach().cpu().numpy()
         
-        # Handle CHW format
-        if video.shape[1] in [1, 3]:  # TCHW
-            video = np.transpose(video, (0, 2, 3, 1))
+        # Handle 5D input (B, T, C, H, W) or (B, T, H, W, C) - squeeze batch dimension
+        if video.ndim == 5:
+            video = video[0]  # Take first batch element -> (T, C, H, W) or (T, H, W, C)
+        
+        # wandb.Video expects (T, C, H, W) format
+        # Detect if input is THWC (last dim is 1 or 3) and convert to TCHW
+        if video.ndim == 4 and video.shape[-1] in [1, 3]:  # THWC format
+            video = np.transpose(video, (0, 3, 1, 2))  # -> TCHW
         
         # Normalize to [0, 255]
         if video.max() <= 1.0:
@@ -506,9 +521,9 @@ class WandbLogger:
         else:
             video = video.astype(np.uint8)
         
-        # Handle grayscale
-        if video.shape[-1] == 1:
-            video = np.repeat(video, 3, axis=-1)
+        # Handle grayscale: expand channels from 1 to 3
+        if video.shape[1] == 1:  # Single channel in TCHW format
+            video = np.repeat(video, 3, axis=1)
         
         return video
     
