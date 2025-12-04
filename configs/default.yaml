@@ -19,12 +19,12 @@ training:
   batch_size: 16                # Batch size per GPU (effective: 16 * num_gpus)
   batch_length: 64              # Sequence length for BPTT
   prefill_steps: 5000           # Prefill replay buffer before training
-  train_ratio: 32.0             # Train steps per env step (DreamerV3 default)
+  train_ratio: 16.0             # Train steps per env step (DreamerV3 default)
   eval_every: 100_000           # Evaluate every 100k steps
   eval_episodes: 10
   checkpoint_every: 50_000      # Save checkpoint every 50k steps
-  log_every: 300                # Log metrics every 300 steps (matches psp_camera_ready)
-  log_video_every: 10_000       # Log videos every 10k steps
+  log_every: 1000                # Log metrics every 300 steps (matches psp_camera_ready)
+  log_video_every: 25_000       # Log videos every 10k steps
 
 # Replay Buffer
 replay:
@@ -42,5 +42,5 @@ logging:
   log_images: True
   log_videos: True
   log_histograms: False
-  image_log_freq: 10_000        # Log images every 10k steps
-  video_log_freq: 10_000        # Log videos every 10k steps
+  image_log_freq: 25_000        # Log images every 10k steps
+  video_log_freq: 25_000        # Log videos every 10k steps

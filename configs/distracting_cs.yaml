@@ -7,7 +7,7 @@ environment:
   # DMC task settings
   domain: walker
   task: walk
-  num_envs: 1  # 8 parallel environments (1 per GPU for 8-GPU training)
+  num_envs: 8  # 8 parallel environments (1 per GPU for 8-GPU training)
   
   # ColorGrid Distraction settings (MDP-correlated, recommended)
   use_color_grid: True
